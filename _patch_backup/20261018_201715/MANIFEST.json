@@ -1,0 +1,12 @@
+{
+ "patch": "perf_gpu_v4",
+ "created": [],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/render/media.py",
+  "minicut/shared/core.py",
+  "minicut/shared/dialogs.py",
+  "minicut/workspace/timeline.py",
+  "minicut/workspace/node_editor.py"
+ ]
+}

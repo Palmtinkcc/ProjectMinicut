@@ -1,0 +1,9 @@
+{
+ "patch": "timeline_speed_ring",
+ "created": [],
+ "replaced": [
+  "minicut/render/media.py",
+  "minicut/workspace/progress_ring.py",
+  "minicut/workspace/timeline.py"
+ ]
+}

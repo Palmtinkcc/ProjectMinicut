@@ -1,0 +1,7 @@
+{
+  "patch": "patch32_hw_decode_validation",
+  "created": [],
+  "replaced": [
+    "minicut/render/media.py"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+ "patch": "proxy_amf_fix",
+ "created": [],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/render/media.py",
+  "minicut/shared/core.py",
+  "minicut/shared/dialogs.py"
+ ]
+}

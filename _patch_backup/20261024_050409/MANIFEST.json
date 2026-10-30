@@ -1,0 +1,23 @@
+{
+ "patch": "ui_rewrite",
+ "created": [
+  "minicut/shared/ui.py",
+  "minicut/workspace/preview_widgets.py"
+ ],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/project/create.py",
+  "minicut/render/export.py",
+  "minicut/shared/dialogs.py",
+  "minicut/shared/icons.py",
+  "minicut/shared/widgets.py",
+  "minicut/workspace/actions.py",
+  "minicut/workspace/afx_panel.py",
+  "minicut/workspace/curve_panel.py",
+  "minicut/workspace/effects_panel.py",
+  "minicut/workspace/node_editor.py",
+  "minicut/workspace/panels.py",
+  "minicut/workspace/progress_ring.py",
+  "minicut/workspace/timeline.py"
+ ]
+}

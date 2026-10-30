@@ -1,0 +1,8 @@
+{
+  "patch": "patch36_render_diagnostics",
+  "files": [
+    "minicut/render/renderer.py",
+    "minicut/render/media.py"
+  ],
+  "created": "20261029_001415"
+}

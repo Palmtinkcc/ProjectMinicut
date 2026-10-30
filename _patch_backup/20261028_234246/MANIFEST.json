@@ -1,0 +1,7 @@
+{
+  "patch": "patch34_launcher_fix",
+  "replaced": [
+    "MiniCut_Launcher.pyw"
+  ],
+  "created": []
+}

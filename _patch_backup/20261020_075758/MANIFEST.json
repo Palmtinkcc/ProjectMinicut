@@ -1,0 +1,18 @@
+{
+ "patch": "viewport_engine",
+ "created": [
+  "minicut/render/fastcomp.py",
+  "minicut/render/gpu.py",
+  "minicut/render/perf.py"
+ ],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/render/effects.py",
+  "minicut/render/media.py",
+  "minicut/render/preview.py",
+  "minicut/render/renderer.py",
+  "minicut/shared/core.py",
+  "minicut/shared/dialogs.py",
+  "minicut/workspace/viewport.py"
+ ]
+}

@@ -1,0 +1,8 @@
+{
+ "patch": "gui_thread_free",
+ "created": [],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/render/renderer.py"
+ ]
+}

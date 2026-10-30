@@ -1,0 +1,19 @@
+{
+ "patch": "media_filter_ui_sound_filter",
+ "created": [
+  "minicut/render/noisecal.py",
+  "minicut/workspace/noise_dialog.py"
+ ],
+ "replaced": [
+  "minicut/render/afx.py",
+  "minicut/shared/core.py",
+  "minicut/workspace/timeline_ops.py",
+  "minicut/workspace/timeline.py",
+  "minicut/render/effects.py",
+  "minicut/render/renderer.py",
+  "minicut/shared/ui.py",
+  "minicut/workspace/preview_widgets.py",
+  "minicut/workspace/effects_panel.py",
+  "minicut/workspace/afx_panel.py"
+ ]
+}

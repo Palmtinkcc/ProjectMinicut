@@ -1,0 +1,22 @@
+{
+ "patch": "speed_filters_recordings_mediadelete",
+ "created": [
+  "minicut/render/speed.py"
+ ],
+ "replaced": [
+  "minicut/shared/core.py",
+  "minicut/workspace/actions.py",
+  "minicut/render/renderer.py",
+  "minicut/render/audio.py",
+  "minicut/render/nodegraph.py",
+  "minicut/render/afx.py",
+  "minicut/workspace/afx_panel.py",
+  "minicut/render/media.py",
+  "minicut/workspace/record_live.py",
+  "minicut/workspace/media_preview.py",
+  "minicut/workspace/timeline.py",
+  "minicut/workspace/timeline_ops.py",
+  "minicut/workspace/panels.py",
+  "minicut/workspace/preview_widgets.py"
+ ]
+}

@@ -1,0 +1,7 @@
+{
+  "patch": "patch35_cpu_spike_reduction",
+  "created": [],
+  "replaced": [
+    "minicut/render/renderer.py"
+  ]
+}

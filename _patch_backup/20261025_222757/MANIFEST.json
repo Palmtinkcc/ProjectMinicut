@@ -1,0 +1,13 @@
+{
+ "patch": "autosave",
+ "created": [
+  "minicut/project/autosave.py"
+ ],
+ "replaced": [
+  "minicut/shared/core.py",
+  "minicut/app.py",
+  "minicut/project/create.py",
+  "minicut/workspace/actions.py",
+  "minicut/shared/dialogs.py"
+ ]
+}

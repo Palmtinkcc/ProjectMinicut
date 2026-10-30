@@ -1,0 +1,7 @@
+{
+  "patch": "patch33_hw_decode_load_stutter",
+  "created": [],
+  "replaced": [
+    "minicut/render/media.py"
+  ]
+}

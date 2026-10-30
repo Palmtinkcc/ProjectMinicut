@@ -1,0 +1,10 @@
+{
+ "patch": "perf_gpu_v9",
+ "created": [],
+ "replaced": [
+  "minicut/app.py",
+  "minicut/shared/core.py",
+  "minicut/workspace/actions.py",
+  "minicut/workspace/panels.py"
+ ]
+}

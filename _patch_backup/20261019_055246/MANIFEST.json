@@ -1,0 +1,8 @@
+{
+ "patch": "mask_layers_image",
+ "created": [],
+ "replaced": [
+  "minicut/render/renderer.py",
+  "minicut/workspace/panels.py"
+ ]
+}

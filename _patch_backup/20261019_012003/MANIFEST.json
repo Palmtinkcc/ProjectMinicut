@@ -1,0 +1,8 @@
+{
+ "patch": "perf_gpu_v8",
+ "created": [],
+ "replaced": [
+  "minicut/render/media.py",
+  "minicut/shared/dialogs.py"
+ ]
+}
