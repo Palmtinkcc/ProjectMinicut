@@ -1,7 +1,0 @@
-{
- "patch": "group_edit_fix",
- "created": [],
- "replaced": [
-  "minicut/workspace/timeline.py"
- ]
-}
