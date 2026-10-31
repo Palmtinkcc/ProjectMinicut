@@ -44,15 +44,32 @@ class ProjectMixin:
     def new_project(self):
         d=NewProjectDialog(self)
         if d.exec()!=QDialog.Accepted:return
-        name,w,h,fps=d.data(); self.proj=Project(name,w,h,fps); self.proj.path=None; self.t=0; self.sel=None; self._undo=[]; self._redo=[]; self._build_editor(); self.stack.setCurrentWidget(self.editor); self.request_render()
+        name,w,h,fps=d.data(); self.proj=Project(name,w,h,fps); self.proj.path=None; self.t=0; self.sel=None; self._undo=[]; self._redo=[]; self._retire_renderer(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self._build_editor(); self.stack.setCurrentWidget(self.editor); self.request_render()
     def open_dialog(self):
         p,_=QFileDialog.getOpenFileName(self,'Open MiniCut project',self.settings['project_folder'],'MiniCut project (*.minicut *.json)')
         if p:self.load_project(p)
     def load_project(self,p):
         try:
             with open(p,'r',encoding='utf-8') as f:d=json.load(f)
-            self.proj=Project.from_dict(d); self.proj.path=p; self.t=0; self.sel=None; self._undo=[]; self._redo=[]; self.pool=MediaPool(); self.renderer=Renderer(self.pool); self._build_editor(); self.stack.setCurrentWidget(self.editor); self.request_render()
+            self.proj=Project.from_dict(d); self.proj.path=p; self.t=0; self.sel=None; self._undo=[]; self._redo=[]; self._retire_renderer(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self._build_editor(); self.stack.setCurrentWidget(self.editor); self.request_render()
         except Exception as ex: QMessageBox.warning(self,'Open failed',str(ex))
+    def _retire_renderer(self):
+        """Patch 48: stop the previous project's render worker, baked-proxy manager and media pool before the new ones are made. The worker kept the
+        OLD renderer (the preview could show frames of the previous project) and a loaded project made its pool without the proxy setting."""
+        w = getattr(self, '_rworker', None)
+        if w is not None:
+            try: w.stop()
+            except Exception: pass
+            self._rworker = None
+        old = getattr(self, 'renderer', None)
+        if old is not None:
+            bm = getattr(old, 'bake', None)
+            if bm is not None:
+                try: bm.stop()
+                except Exception: pass
+            try:
+                with old._src_lock: self.pool.reset()
+            except Exception: pass
     def save_project(self):
         if not self.proj:return
         path=self.proj.path

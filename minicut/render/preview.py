@@ -68,7 +68,15 @@ class PlaybackMixin:
         budget = self.frame_ms(); now = time.monotonic()
         if now < getattr(self, "_adapt_hold", 0.0): return getattr(self, "_adapt", 1.0)
         ms = getattr(w, "last_ms", 0.0); ema = getattr(self, "_ema", None)
-        ema = ms if ema is None else ema * 0.7 + ms * 0.3; self._ema = ema
+        # Use a faster EMA when quality needs to recover (renders are well inside
+        # budget) so the picture sharpens up again quickly after a heavy segment.
+        if ema is None:
+            ema = ms
+        elif ms < ema:
+            ema = ema * 0.5 + ms * 0.5   # fast recovery when render time drops
+        else:
+            ema = ema * 0.7 + ms * 0.3   # slower rise to avoid flip-flopping
+        self._ema = ema
         a = getattr(self, "_adapt", 1.0)
         if ema > budget * 1.15: a = max(0.5, a - 0.1)
         elif ema < budget * 0.6: a = min(1.0, a + 0.05)
@@ -88,9 +96,13 @@ class PlaybackMixin:
         if not self.proj or not hasattr(self, "viewport"): return
         q = self.settings["preview_quality"]
         if self.settings["fit_viewport"]:        # never draw more pixels than the preview shows
-            try: fit = self.viewport.display_scale()
-            except Exception: fit = 1.0
-            q = min(q, max(0.1, min(1.0, math.ceil(fit * 20) / 20.0)))
+            # Cache display_scale so Qt layout is not recalculated on every playback tick.
+            _now = time.monotonic()
+            if _now - getattr(self, "_fit_ts", 0.0) > 0.25:
+                try: self._fit_scale = self.viewport.display_scale()
+                except Exception: self._fit_scale = 1.0
+                self._fit_ts = _now
+            q = min(q, max(0.1, min(1.0, math.ceil(getattr(self, "_fit_scale", 1.0) * 20) / 20.0)))
         w = getattr(self, "_rworker", None)
         # Adaptive preview replaces the fixed "half while playing" step, so the two never stack into a very blurry image.
         adaptive = self.playing and self.settings["adaptive_preview"] and w is not None

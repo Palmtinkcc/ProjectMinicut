@@ -354,13 +354,20 @@ class MediaDelegate(QStyledItemDelegate):
     """A media card: picture, kind badge, length, name. Move the mouse over a video card to skim through it."""
     def __init__(self, lst): super().__init__(lst); self.lst = lst; self._pm = {}
     def _pixmap(self, path, kind, t, w):
-        img = self.lst.app.thumbs.thumb(path, kind, t, 110)
+        img = self.lst.app.thumbs.thumb(path, kind, t, 110, True)
         if img is None: return None
         key = (path, round(t, 1)); pm = self._pm.get(key)
         if pm is None:
             if len(self._pm) > 400: self._pm.clear()
             pm = self._pm[key] = QPixmap.fromImage(img)
         return pm
+    _CHK = None
+    def _checker(self):
+        """Patch 48: transparent pictures (PNG, GIF) are shown on a grey chequerboard, so dark or white art on a clear background is not lost."""
+        if MediaDelegate._CHK is None:
+            pm = QPixmap(16, 16); pm.fill(QColor("#7d7d84")); q = QPainter(pm); q.fillRect(0, 0, 8, 8, QColor("#64646b")); q.fillRect(8, 8, 8, 8, QColor("#64646b")); q.end()
+            MediaDelegate._CHK = QBrush(pm)
+        return MediaDelegate._CHK
     def sizeHint(self, opt, idx): return QSize(150, 124)
     def paint(self, p, opt, idx):
         p.save(); p.setRenderHint(QPainter.Antialiasing); c = pal(); path = idx.data(Qt.UserRole); kind = idx.data(Qt.UserRole + 1); app = self.lst.app
@@ -378,6 +385,7 @@ class MediaDelegate(QStyledItemDelegate):
         elif kind in ("video", "image", "gif"):
             pm = self._pixmap(path, kind, (frac * dur) if (frac is not None and not mprev_active) else 1.0, 110) or (self._pixmap(path, kind, 1.0, 110))
             if pm is not None:
+                if kind != "video": p.fillRect(th, self._checker())
                 sc = pm.scaled(int(th.width()), int(th.height()), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                 p.drawPixmap(int(th.left()), int(th.top()), sc, (sc.width() - int(th.width())) // 2, (sc.height() - int(th.height())) // 2, int(th.width()), int(th.height()))
         p.restore()

@@ -94,7 +94,18 @@ def short_label(name):
     m = re.search(r"perf_gpu_patch(?:_v(\d+))?", low)
     if m: return "Perf/GPU v%s" % (m.group(1) or "1")
     m = re.match(r"apply_(\d+(?:\.\d+)?)", low)
-    if m: return "Patch " + m.group(1)
+    if m:
+        n = m.group(1)
+        # Patches 33 and above are display-renamed: 33 -> 32(V1), 34 -> 32(V2), ...
+        # The patch number in the filename is still used for ordering.
+        try:
+            major = int(float(n))
+            if major >= 33:
+                v = major - 32
+                return "32(V%d)" % v
+        except (ValueError, TypeError):
+            pass
+        return "Patch " + n
     return os.path.splitext(name)[0]
 
 

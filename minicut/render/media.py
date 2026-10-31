@@ -388,19 +388,24 @@ class _Reader:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Patch 45: video frames through an FFmpeg pipe (hardware decode that is verified, CPU decode otherwise).
-#   * Hardware decoding is only used when "GPU video decode" is on in Settings AND the first frame it gives is
-#     checked against the CPU decoder (a pink band / wrong colours fail the check) -> then that backend is not used.
-#   * Any problem (FFmpeg does not start, no frames, ...) switches this video to the old cv2.VideoCapture reader.
-#   * Set the environment variable MINICUT_CV2_DECODE=1 to use only the old reader.
+# Patch 45 / 48: GPU decoding through an FFmpeg pipe, used only for sustained playback.
+#   * Jumps (clicking, scrubbing) and the first frames of every start are read by OpenCV: it seeks at once. An FFmpeg process needs
+#     time to start (a GPU decoder even more), so it is never started for a jump.
+#   * After _RUN_MIN frames in a row (it is playing) a process is started in the BACKGROUND a little ahead of the playhead; when it
+#     has its first frame it takes over. Nothing waits for it.
+#   * That first frame is compared with the OpenCV frame (a pink band or wrong colours fail): the backend is then marked bad for this
+#     kind of video (codec and size) and the next one is tried. The answer is kept in hwdec.json, so it is asked once, not at every start.
+#   * Any problem: this video goes back to OpenCV. A process that is not used for 4 s is stopped. At most 6 run at once.
+#   * MINICUT_CV2_DECODE=1 uses only OpenCV.
 # ---------------------------------------------------------------------------------------------------------------
+import json as _json
 _FF_LIVE = OrderedDict(); _FF_LOCK = threading.Lock()      # readers that own a running ffmpeg (kept to a few)
-_FF_MAX_LIVE = 6
-_FILE_HW = {}; _BAD_HW = {}; _HW_LISTED = []
+_FF_MAX_LIVE = 6; _FF_PENDING = [0]; _RUN_MIN = 10; _BAD_MAX_AGE = 14 * 86400
+_BAD_HW = {}; _HW_LISTED = []; _HW_DB = {"v": 1, "cls": {}}; _HW_STATE = {"loaded": False}; _HW_LOCK = threading.Lock(); _FF_REAPER = [None]
 
 
 def _hw_candidates():
-    """Hardware decoders this FFmpeg build lists, best first. Listed does not mean working: each is verified."""
+    """Hardware decoders this FFmpeg build lists, best first. Listed does not mean working: each is checked when it is used."""
     if not _HW_LISTED:
         try:
             out = subprocess.run([FFMPEG, "-hide_banner", "-hwaccels"], capture_output=True, text=True, errors="ignore",
@@ -412,23 +417,53 @@ def _hw_candidates():
     return _HW_LISTED[0]
 
 
+def _hw_path():
+    try: from ..shared.core import APP_DIR
+    except Exception: APP_DIR = os.path.join(os.path.expanduser("~"), ".minicut")
+    return os.path.join(APP_DIR, "hwdec.json")
+
+
+def _hw_db():
+    with _HW_LOCK:
+        if not _HW_STATE["loaded"]:
+            _HW_STATE["loaded"] = True
+            try:
+                with open(_hw_path(), encoding="utf-8") as fh: d = _json.load(fh)
+                if isinstance(d, dict) and d.get("v") == 1 and isinstance(d.get("cls"), dict): _HW_DB["cls"] = d["cls"]
+            except Exception: pass
+        return _HW_DB["cls"]
+
+
+def _hw_save():
+    try:
+        p = _hw_path(); os.makedirs(os.path.dirname(p), exist_ok=True); tmp = p + ".tmp"
+        with _HW_LOCK:
+            with open(tmp, "w", encoding="utf-8") as fh: _json.dump(_HW_DB, fh)
+        os.replace(tmp, p)
+    except Exception: pass
+
+
+def _ff_reap():
+    while True:
+        time.sleep(2.0); now = time.monotonic()
+        with _FF_LOCK: idle = [r for r in _FF_LIVE.values() if now - r.last_use > 4.0]
+        for r in idle: r._stop()
+
+
 class _FFReader:
-    """Same interface as _Reader (read(idx) / release()) but frames come from an FFmpeg subprocess pipe."""
-    def __init__(self, path, fps, n, w, h, fallback):
-        self.path = safe_path(path); self.fps = float(fps); self.n = n; self.w = w; self.h = h
-        self.fallback = fallback; self.proc = None; self.pos = -10; self.raw = None
-        self.backend = None; self.decided = False; self.dead = False; self.bad = 0
-        try: st = os.stat(path); self.key = (os.path.abspath(path), st.st_size, int(st.st_mtime))
-        except OSError: self.key = (path, 0, 0)
+    """Same interface as _Reader (read(idx) / release()). OpenCV serves jumps and the start; an FFmpeg pipe serves long runs."""
+    def __init__(self, path, fps, n, w, h, fallback, cls=""):
+        self.path = safe_path(path); self.fps = float(fps); self.n = n; self.w = w; self.h = h; self.fallback = fallback; self.cls = cls or "%dx%d" % (w, h)
+        self.proc = None; self.ppos = -10; self.pos = -10; self.raw = None; self.backend = None; self.dead = False; self.bad = 0; self.run = 0
+        self.pend = None; self.last_use = time.monotonic()
+    # ---- processes
     def _spawn(self, idx, backend):
         t = max(0.0, (idx - 0.5) / self.fps)          # half a frame early: the first frame given is exactly idx
         c = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin"]
-        if backend: c += ["-hwaccel", backend]
+        if backend and backend != "cpu": c += ["-hwaccel", backend]
         if t > 0: c += ["-ss", "%.6f" % t]
-        c += ["-i", self.path, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "scale=%d:%d" % (self.w, self.h),
-              "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
-        return subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                                creationflags=NOWIN, bufsize=0)
+        c += ["-i", self.path, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "scale=%d:%d" % (self.w, self.h), "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+        return subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=NOWIN, bufsize=0)
     @staticmethod
     def _kill(proc):
         if proc is None: return
@@ -448,73 +483,113 @@ class _FFReader:
         except Exception:
             return None
         return buf
-    def _decide(self, idx):
-        """Pick the hardware backend once per file: it must give the same picture as the CPU decoder."""
-        self.decided = True; self.backend = None
-        if not CFG.get("hw_decode"): return
-        if self.key in _FILE_HW: self.backend = _FILE_HW[self.key]; return
-        ref = None
-        for b in _hw_candidates():
-            if _BAD_HW.get(b, 0) >= 2: continue
-            hw = cp = None
-            try:
-                hw = self._spawn(idx, b); fh = self._get(hw)
-                if fh is None: _BAD_HW[b] = _BAD_HW.get(b, 0) + 1; continue
-                if ref is None:
-                    cp = self._spawn(idx, None); ref = self._get(cp)
-                if ref is None: break                                  # cannot verify -> stay on the CPU
-                if float(cv2.absdiff(fh, ref).mean()) < 6.0: self.backend = b; break
-            except Exception:
-                _BAD_HW[b] = _BAD_HW.get(b, 0) + 1
-            finally:
-                self._kill(hw); self._kill(cp)
-        _FILE_HW[self.key] = self.backend
-    def _start(self, idx):
-        self._stop()
-        proc = self._spawn(idx, self.backend)
+    def _register(self, proc):
         with _FF_LOCK:
-            self.proc = proc; _FF_LIVE[id(self)] = self
+            self.proc = proc; self.last_use = time.monotonic(); _FF_LIVE[id(self)] = self
             while len(_FF_LIVE) > _FF_MAX_LIVE:                       # too many ffmpeg running: stop the least used
                 _, o = _FF_LIVE.popitem(last=False)
                 if o is not self: p, o.proc = o.proc, None; self._kill(p)
-        return proc
+        if _FF_REAPER[0] is None:
+            _FF_REAPER[0] = threading.Thread(target=_ff_reap, name="MiniCutFFReap", daemon=True); _FF_REAPER[0].start()
     def _stop(self):
         with _FF_LOCK:
             p, self.proc = self.proc, None; _FF_LIVE.pop(id(self), None)
         self._kill(p)
+    # ---- what is known about this kind of video
+    def _entry(self):
+        ent = _hw_db().setdefault(self.cls, {"ok": "", "bad": [], "t": time.time()})
+        if time.time() - ent.get("t", 0) > _BAD_MAX_AGE: ent.update({"ok": "", "bad": [], "t": time.time()})       # drivers and FFmpeg change: ask again
+        return ent
+    def _pick_backend(self):
+        ent = self._entry(); cands = ([ent["ok"]] if ent.get("ok") else []) + [b for b in _hw_candidates() if b != ent.get("ok")]
+        for b in cands:
+            if b and b not in ent["bad"] and _BAD_HW.get(b, 0) < 3: return b
+        return None
+    def _mark_bad(self, b):
+        ent = self._entry(); _BAD_HW[b] = _BAD_HW.get(b, 0) + 1
+        if b not in ent["bad"]: ent["bad"].append(b)
+        if ent.get("ok") == b: ent["ok"] = ""
+        ent["t"] = time.time(); _hw_save()
+    def _mark_ok(self, b):
+        ent = self._entry()
+        if ent.get("ok") != b: ent["ok"] = b; ent["t"] = time.time(); _hw_save()
+    # ---- starting the pipe in the background
+    def _want_pipe(self, idx):
+        if self.pend is not None or self.proc is not None or self.dead: return
+        with _FF_LOCK:
+            if _FF_PENDING[0] >= 2: return
+            _FF_PENDING[0] += 1
+        target = idx + max(8, int(self.fps * 0.5))
+        if self.n > 0: target = min(target, self.n - 1)
+        pend = {"idx": target, "b": None, "done": False, "proc": None, "first": None, "none": False}; self.pend = pend
+        def work():
+            proc = first = None
+            try:
+                b = self._pick_backend(); pend["b"] = b
+                if b is None: pend["none"] = True
+                else: proc = self._spawn(target, b); first = self._get(proc)
+            except Exception: first = None
+            if pend.get("cancel"): self._kill(proc); proc = None
+            pend["proc"] = proc; pend["first"] = first; pend["done"] = True
+            with _FF_LOCK: _FF_PENDING[0] = max(0, _FF_PENDING[0] - 1)
+        threading.Thread(target=work, name="MiniCutFFStart", daemon=True).start()
+    def _drop_pend(self):
+        p, self.pend = self.pend, None
+        if p is None: return
+        p["cancel"] = True
+        if p["done"]: self._kill(p["proc"])
+    def _takeover(self, idx):
+        """The picture at idx from the pipe that was started in the background, or None while it is not ready."""
+        p = self.pend
+        if p is None or not p["done"] or idx < p["idx"]: return None
+        self.pend = None; proc, first = p["proc"], p["first"]
+        if p["none"]: self.dead = True; return None                            # no GPU decoder is left to try: OpenCV from now on
+        if first is None: self._kill(proc); self._mark_bad(p["b"]); return None
+        if idx - p["idx"] > 30: self._kill(proc); return None                  # it came too late: try again from here
+        img = first
+        for _ in range(idx - p["idx"]):
+            img = self._get(proc)
+            if img is None: break
+        ref = self.fallback.read(idx)
+        if img is None or ref is None or float(cv2.absdiff(img, ref).mean()) >= 6.0:
+            self._kill(proc); self._mark_bad(p["b"]); return None            # wrong picture (or no picture): not this backend for this kind of video
+        self._register(proc); self.backend = p["b"]; self.ppos = idx; self._mark_ok(p["b"]); return img
+    def _from_pipe(self, idx):
+        proc = self.proc; gap = idx - self.ppos
+        if proc is None or proc.poll() is not None or gap < 1 or gap > 8: self._stop(); return None
+        for _ in range(gap - 1):
+            if self._get(proc) is None: self._stop(); self.bad += 1; return None
+        img = self._get(proc)
+        if img is None:
+            self._stop(); self.bad += 1
+            if self.bad >= 2: self.dead = True
+            return None
+        self.ppos = idx; self.last_use = time.monotonic()
+        with _FF_LOCK:
+            if id(self) in _FF_LIVE: _FF_LIVE.move_to_end(id(self))
+        return img
     def read(self, idx):
         if self.dead: return self.fallback.read(idx)
         if self.n > 0: idx = max(0, min(self.n - 1, idx))
         if idx == self.pos and self.raw is not None: return self.raw
+        seq = self.pos >= 0 and 1 <= idx - self.pos <= 4
+        if seq: self.run += 1
+        else: self.run = 0; self._stop(); self._drop_pend()                    # a jump: no pipe, OpenCV seeks at once
+        img = None
         try:
-            if not self.decided:
-                self._decide(idx)
-                if self.backend is None: self.dead = True; return self.fallback.read(idx)      # no GPU decoder passed the check: OpenCV (CPU)
-            for _ in range(3):
-                proc = self.proc; gap = idx - self.pos; fresh = False
-                if proc is None or proc.poll() is not None or gap <= 0 or gap > 8:
-                    proc = self._start(idx); fresh = True; skip = 0
-                else: skip = gap - 1
-                f = None; ok = True
-                for _s in range(skip):
-                    if self._get(proc) is None: ok = False; break
-                if ok: f = self._get(proc)
-                if f is not None:
-                    self.raw = f; self.pos = idx; self.bad = 0
-                    with _FF_LOCK:
-                        if id(self) in _FF_LIVE: _FF_LIVE.move_to_end(id(self))
-                    return f
-                self.pos = -10; self._stop()
-                if fresh:
-                    if self.backend: self.backend = None; _FILE_HW[self.key] = None; continue    # hardware failed -> CPU
-                    self.bad += 1; break
+            if seq:
+                if self.proc is not None: img = self._from_pipe(idx)
+                elif self.pend is not None: img = self._takeover(idx)
+            if img is None:
+                img = self.fallback.read(idx)
+                if seq and self.run >= _RUN_MIN and self.proc is None and self.pend is None and not self.dead: self._want_pipe(idx)
         except Exception:
-            self.bad += 1
-        if self.raw is None or self.bad >= 2:                          # nothing ever read / keeps failing: old reader
-            self.dead = True; self._stop(); return self.fallback.read(idx)
-        return self.raw                                                # e.g. end of file: keep the last picture
+            self.bad += 1; self._stop(); self._drop_pend(); img = self.fallback.read(idx)
+            if self.bad >= 3: self.dead = True
+        if img is not None: self.raw = img; self.pos = idx
+        return img if img is not None else self.raw
     def release(self):
-        self._stop()
+        self._stop(); self._drop_pend()
         try: self.fallback.release()
         except Exception: pass
 
@@ -527,7 +602,10 @@ def _ff_on():
 def _make_reader(path, probe, fps, n, w, h):
     if not _ff_on() or w <= 0 or h <= 0 or not fps or fps != fps:
         return _Reader(probe)
-    return _FFReader(path, fps, n, w, h, _Reader(probe))
+    try:
+        fc = int(probe.get(cv2.CAP_PROP_FOURCC)); cc = "".join(chr((fc >> (8 * i)) & 255) for i in range(4)) if fc else "?"
+    except Exception: cc = "?"
+    return _FFReader(path, fps, n, w, h, _Reader(probe), "%s|%dx%d" % (cc, w, h))
 
 
 class VideoSource:
@@ -588,7 +666,7 @@ class VideoSource:
         if raw is None: raw = self.orig.read(idx)
         if raw is None: raw = np.zeros((max(1, self.h), max(1, self.w), 3), np.uint8)
         self.rawc[key] = raw
-        while len(self.rawc) > 4: self.rawc.popitem(last=False)
+        while len(self.rawc) > 12: self.rawc.popitem(last=False)  # keep more decoded frames to reduce re-decodes on scrub
         return raw
     def frame(self, t, ds=1.0):
         t = max(0.0, t); idx = int(t * self.fps + 1e-6)
@@ -767,7 +845,11 @@ def make_thumb(path, kind, t, h):
         if not ok: cap.set(cv2.CAP_PROP_POS_FRAMES, 0); ok, img = cap.read()
         cap.release()
         if not ok: return None
-    elif kind == "image": img = to_bgra(imread_any(path))
+    elif kind == "image":
+        img = to_bgra(imread_any(path))
+        if img is None:                                  # Patch 48: OpenCV could not read it (an unusual PNG ...): try Pillow
+            try: im = Image.open(path); im.load(); img = cv2.cvtColor(np.array(im.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
+            except Exception: img = None
     elif kind == "gif":
         im = Image.open(path); im.seek(0); img = cv2.cvtColor(np.array(im.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
     if img is None: return None
@@ -787,7 +869,7 @@ class _Job(QRunnable):
 class ThumbStore(QObject):
     updated = Signal()
     def __init__(self):
-        super().__init__(); self.cache = OrderedDict(); self.pending = set()
+        super().__init__(); self.cache = OrderedDict(); self.pending = set(); self._fail = {}
         self.pool = QThreadPool(); self.pool.setMaxThreadCount(1)
         # Timeline thumbnails are background decoration: keep their CPU contention low so
         # preview decoding/compositing and the GUI have room to run during auto-scroll.
@@ -795,15 +877,22 @@ class ThumbStore(QObject):
         except Exception: pass
         self.apool = QThreadPool(); self.apool.setMaxThreadCount(1)      # sound of the cards: one at a time, thumbnails are not held up
         self.ppool = QThreadPool(); self.ppool.setMaxThreadCount(1)      # sound of the file that is being previewed
-    def _run(self, key, fn, pool=None):
+    def _run(self, key, fn, pool=None, prio=0):
         self.pending.add(key)
         def cb(r, key=key):
-            self.cache[key] = r; self.pending.discard(key)
+            self.pending.discard(key)
+            if r is None and isinstance(key, tuple) and key and key[0] == "t":
+                # Patch 48: a thumbnail that failed is tried again (after 4 s, three times) instead of being given up for good
+                n = self._fail.get(key, (0, 0.0))[0] + 1; self._fail[key] = (n, time.monotonic())
+                if n >= 3: self.cache[key] = None
+            else: self.cache[key] = r
             while len(self.cache) > 1500: self.cache.popitem(last=False)
             self.updated.emit()
-        (pool or self.pool).start(_Job(fn, cb))
-    def thumb(self, path, kind, t, h):
+        (pool or self.pool).start(_Job(fn, cb), prio)
+    def thumb(self, path, kind, t, h, urgent=False):
         key = ("t", path, round(t, 1), h)
+        f = self._fail.get(key)
+        if f is not None and key not in self.cache and time.monotonic() - f[1] < 4.0: return None
         if key in self.cache:
             try: self.cache.move_to_end(key)
             except Exception: pass
@@ -812,7 +901,7 @@ class ThumbStore(QObject):
             # Scrolling can expose hundreds of new thumbnail timestamps quickly. Bound the queued
             # work so stale thumbnails cannot build an unbounded backlog ahead of playback.
             queued = sum(1 for k in self.pending if isinstance(k, tuple) and k and k[0] == "t")
-            if queued >= 8:
+            if queued >= 8 and not urgent:       # the cards of the media pool are never held back (and go first)
                 try:
                     from .debug_trace import trace_event
                     now = time.monotonic()
@@ -822,7 +911,7 @@ class ThumbStore(QObject):
                         trace_event("thumbnail_queue_throttled", pending=queued, limit=8)
                 except Exception: pass
                 return None
-            self._run(key, lambda: make_thumb(path, kind, t, h))
+            self._run(key, lambda: make_thumb(path, kind, t, h), None, 10 if urgent else 0)
         return None
     def wave(self, path):
         if path in AUDIO.peaks: return AUDIO.peaks[path]
