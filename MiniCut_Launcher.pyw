@@ -1,48 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MiniCut Launcher  (smart update edition)
-========================================
-Put this file in the MiniCut folder (next to file.py). Put the update files (apply_*.py) in the folder  Patch/  (it is
-created for you). Then double-click this launcher.
+MiniCut Launcher  (optimized edition)
+======================================
+Put this file in the MiniCut folder (next to file.py). Put update files (apply_*.py)
+in the Patch/ folder.
 
-  * Start MiniCut (Normal / Debug)   opens the program (uses the .venv the program already uses)
-  * Smart Update                     works out by itself which updates are missing and in which order they must go,
-                                     then installs them one by one (the newest update is shown at the top of the list)
-  * Install Selected                 installs the picked update, plus any earlier update it needs first
-  * Undo last update                 puts back the files of the most recent update (one step at a time)
+  * Start MiniCut (Normal / Debug)   opens the program using the .venv
+  * Smart Update                     detects and installs missing patches in order
+  * Install Selected                 installs the selected patch (plus dependencies)
+  * Undo Last Update                 reverts the most recent installed patch
+  * Official Website                 opens https://bc-minicut.netlify.app/
 
-How the status is found (works the same after you copy the folder to another computer):
-  every update file carries a fingerprint (hash) of the program files it expects and of the files it writes. The launcher
-  compares those fingerprints with the files that are really in the folder, so it does not depend on the _patch_backup
-  folder or on anything that was stored on the old computer.
-      installed   the files are already at this update (or at a newer one)
-      ready       the files are exactly what this update expects: it can be installed now
-      queued      needs an earlier update first - Smart Update puts it in the right order
-      blocked     an earlier update that it needs is not in the Patch folder
-      conflict    a file was changed by hand / is not a version that any update knows
-      included    a newer update replaces this one (for example 25.3 includes 25 and 25.2)
+How status is determined (fingerprint-based, works after folder copy):
+  installed   files already at this version (or newer)
+  ready       files match exactly what this patch expects
+  queued      needs an earlier patch first (Smart Update handles ordering)
+  blocked     a required earlier patch is missing from the Patch folder
+  conflict    file was manually edited or is an unknown version
+  included    a newer patch supersedes this one (started from the same file)
 
-The list refreshes by itself when you add / remove an update file in the Patch folder.
-Close MiniCut before you install or undo an update.
+BUG FIXES vs original:
+  * REPLACE/FILES/EDITS base field: now correctly handles list-of-hashes
+    (patches 50+ declare base as a list of accepted prior versions)
 
-Command line (for testing):  python MiniCut_Launcher.pyw --cli status | plan | install | undo | start
+The list auto-refreshes when you add/remove files in the Patch folder.
+CLI:  python MiniCut_Launcher.pyw --cli status | plan | install | undo | start
 """
-import ast, datetime, hashlib, json, os, re, shutil, subprocess, sys, threading, queue, time
+import ast, datetime, hashlib, json, os, re, shutil, subprocess, sys, threading, queue, time, webbrowser
 
-ROOT = os.environ.get("MINICUT_ROOT") or os.path.dirname(os.path.abspath(__file__))
-PATCH_DIR = os.path.join(ROOT, "Patch")
-BACKUP_DIR = os.path.join(ROOT, "_patch_backup")
-IS_WIN = os.name == "nt"
-NOWIN = 0x08000000 if IS_WIN else 0          # CREATE_NO_WINDOW
-DETACHED = 0x00000008 | 0x00000200 if IS_WIN else 0   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-NEW_CONSOLE = 0x00000010 if IS_WIN else 0    # CREATE_NEW_CONSOLE (debug launch keeps a console window open)
+_LAUNCHER_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT       = os.environ.get("MINICUT_ROOT") or os.path.join(_LAUNCHER_DIR, "minicut")
+PATCH_DIR  = os.path.join(_LAUNCHER_DIR, "Patch")
+BACKUP_DIR = os.path.join(_LAUNCHER_DIR, "_patch_backup")
+IS_WIN     = os.name == "nt"
+NOWIN      = 0x08000000 if IS_WIN else 0
+DETACHED   = (0x00000008 | 0x00000200) if IS_WIN else 0
+NEW_CONSOLE= 0x00000010 if IS_WIN else 0
+WEBSITE    = "https://bc-minicut.netlify.app/"
 
 
-# ───────────────────────── basic helpers ─────────────────────────
+# ─────────────────────────── helpers ───────────────────────────
 def python_for_minicut():
-    """The interpreter the program runs with: the .venv that Run_MiniCut.bat creates, else this Python."""
-    for cand in (os.path.join(ROOT, ".venv", "Scripts", "python.exe"), os.path.join(ROOT, ".venv", "bin", "python")):
+    for cand in (os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
+                 os.path.join(ROOT, ".venv", "bin", "python")):
         if os.path.exists(cand): return cand
     exe = sys.executable
     if IS_WIN and os.path.basename(exe).lower() == "pythonw.exe":
@@ -52,7 +53,6 @@ def python_for_minicut():
 
 
 def norm_hash(b):
-    """Same fingerprint the update files use (line endings do not matter)."""
     return hashlib.sha256(b.replace(b"\r\n", b"\n")).hexdigest()
 
 
@@ -62,21 +62,19 @@ def path_of(rel): return os.path.join(ROOT, *rel.split("/"))
 def _write_readme():
     try:
         with open(os.path.join(PATCH_DIR, "README.txt"), "w", encoding="utf-8") as f:
-            f.write("Put the update files here (apply_*.py). The MiniCut Launcher lists them (newest first) and installs\n"
-                    "them in the right order. Do not rename them. The list refreshes by itself.\n")
+            f.write("Put update files here (apply_*.py). "
+                    "The MiniCut Launcher lists them newest-first and installs in the right order.\n")
     except OSError: pass
 
 
 def patch_files_on_disk():
-    """Update files in the Patch folder (unsorted paths)."""
-    if not os.path.isdir(PATCH_DIR): os.makedirs(PATCH_DIR, exist_ok=True); _write_readme()
+    if not os.path.isdir(PATCH_DIR):
+        os.makedirs(PATCH_DIR, exist_ok=True); _write_readme()
     return [os.path.join(PATCH_DIR, n) for n in os.listdir(PATCH_DIR)
             if n.lower().startswith("apply_") and n.lower().endswith(".py")]
 
 
 def version_key(name, mtime=0.0):
-    """Where an update sits in the history, from its file name. Only used for display order and tie-breaks:
-    the real install order comes from the file fingerprints."""
     low = name.lower()
     if "effects" in low: return (0, 0, 0, 0)
     m = re.search(r"perf_gpu_patch(?:_v(\d+))?", low)
@@ -85,7 +83,7 @@ def version_key(name, mtime=0.0):
     if m: return (2, int(m.group(1)), int(m.group(2) or 0), 0)
     m = re.search(r"_v(\d+)", low)
     if m: return (2, int(m.group(1)), 0, 0)
-    return (3, 0, 0, mtime)                      # unknown name: treated as the newest, ordered by file date
+    return (3, 0, 0, mtime)
 
 
 def short_label(name):
@@ -96,28 +94,27 @@ def short_label(name):
     m = re.match(r"apply_(\d+(?:\.\d+)?)", low)
     if m:
         n = m.group(1)
-        # Patches 33 and above are display-renamed: 33 -> 32(V1), 34 -> 32(V2), ...
-        # The patch number in the filename is still used for ordering.
         try:
             major = int(float(n))
             if major >= 33:
-                v = major - 32
-                return "32(V%d)" % v
-        except (ValueError, TypeError):
-            pass
+                return "32(V%d)" % (major - 32)
+        except (ValueError, TypeError): pass
         return "Patch " + n
     return os.path.splitext(name)[0]
 
 
-# ───────────────────────── reading an update file (static, nothing is executed) ─────────────────────────
+# ─────────────────────────── patch loading ───────────────────────────
 class Patch:
+    __slots__ = ("path","name","label","mtime","size","key","pname","title","body",
+                 "files","error","_sig")
     def __init__(self, path):
-        self.path = path; self.name = os.path.basename(path); self.label = short_label(self.name)
+        self.path = path; self.name = os.path.basename(path)
+        self.label = short_label(self.name)
         st = os.stat(path); self.mtime = st.st_mtime; self.size = st.st_size
         self.key = version_key(self.name, self.mtime)
         self.pname = None; self.title = self.name; self.body = ""
-        self.files = []          # (rel, base_hash|None, new_hash, mode)   mode: edit | new | soft
-        self.error = None
+        self.files = []   # (rel, base_hash|None, new_hash, mode)  mode: edit|new|soft
+        self.error = None; self._sig = None
 
 
 def _literal(node):
@@ -125,8 +122,19 @@ def _literal(node):
     except Exception: return None
 
 
+def _normalize_base(b):
+    """
+    BUG FIX: newer patches (50+) declare base as a list of accepted prior hashes.
+    The graph only needs one canonical 'base' per (rel, new) edge — we keep the
+    list so Graph.parents can store all accepted parents correctly.
+    Returns a list (possibly empty/None-containing).
+    """
+    if b is None: return [None]
+    if isinstance(b, list): return b
+    return [b]
+
+
 def read_patch_notes(src, fallback):
-    """Title + bullet list of changes from the update file's own docstring."""
     m = re.search(r'"""(.*?)"""', src, re.S)
     if not m: return fallback, ""
     doc_lines = m.group(1).strip("\n").split("\n")
@@ -160,27 +168,46 @@ def load_patch(path):
     except Exception as ex:
         p.error = "cannot read: %s" % ex; return p
     vals = {}
+    KEYS = ("EDITS","REPLACE","NEW_FILES","FILES","PATCH_NAME","REL","BASE_HASH","NEW_HASH")
     for n in tree.body:
-        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-            k = n.targets[0].id
-            if k in ("EDITS", "REPLACE", "NEW_FILES", "FILES", "PATCH_NAME", "REL", "BASE_HASH", "NEW_HASH"): vals[k] = _literal(n.value)
+        if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id in KEYS):
+            vals[n.targets[0].id] = _literal(n.value)
     p.pname = vals.get("PATCH_NAME") if isinstance(vals.get("PATCH_NAME"), str) else None
     try:
-        for rel, i in (vals.get("EDITS") or {}).items(): p.files.append((rel, i["base"], i["new"], "edit"))
-        for rel, i in (vals.get("REPLACE") or {}).items(): p.files.append((rel, i["base"], i["new"], "edit"))
+        # EDITS format: base is always a single hash string
+        for rel, i in (vals.get("EDITS") or {}).items():
+            p.files.append((rel, i["base"], i["new"], "edit"))
+
+        # REPLACE format: base may be string OR list (BUG FIX)
+        for rel, i in (vals.get("REPLACE") or {}).items():
+            bases = _normalize_base(i["base"])
+            for b in bases:
+                p.files.append((rel, b, i["new"], "edit"))
+
+        # FILES format: base may be None, string, or list (BUG FIX)
         for rel, i in (vals.get("FILES") or {}).items():
-            soft = bool(i.get("soft")) or i.get("base") is None
-            p.files.append((rel, i.get("base"), i["new"], "soft" if soft else "edit"))
+            bases = _normalize_base(i.get("base"))
+            soft = bool(i.get("soft")) or (i.get("base") is None)
+            mode = "soft" if soft else "edit"
+            for b in bases:
+                p.files.append((rel, b, i["new"], mode))
+
+        # NEW_FILES format
         for rel, s in (vals.get("NEW_FILES") or {}).items():
-            p.files.append((rel, None, hashlib.sha256(s.replace("\r\n", "\n").encode("utf-8")).hexdigest(), "new"))
-        # Standalone hash-based patches (such as Patch 32/33) declare one target via REL/BASE_HASH/NEW_HASH.
-        # The launcher only reads these constants with ast.literal_eval; it never executes patch code to inspect it.
-        rel, base_hash, new_hash = vals.get("REL"), vals.get("BASE_HASH"), vals.get("NEW_HASH")
-        if isinstance(rel, str) and isinstance(base_hash, str) and isinstance(new_hash, str):
+            nh = hashlib.sha256(s.replace("\r\n", "\n").encode("utf-8")).hexdigest()
+            p.files.append((rel, None, nh, "new"))
+
+        # Standalone REL/BASE_HASH/NEW_HASH format
+        rel = vals.get("REL"); bh = vals.get("BASE_HASH"); nh = vals.get("NEW_HASH")
+        if isinstance(rel, str) and isinstance(bh, str) and isinstance(nh, str):
             if not any(item[0] == rel for item in p.files):
-                p.files.append((rel, base_hash, new_hash, "edit"))
+                p.files.append((rel, bh, nh, "edit"))
+
     except Exception as ex:
         p.error = "unknown update format: %r" % (ex,)
+
     if not p.files and not p.error: p.error = "no file list found in this update"
     if "effects" in p.name.lower() and not p.pname: p.pname = "effects"
     return p
@@ -190,7 +217,6 @@ _PATCH_CACHE = {}
 
 
 def load_patches():
-    """All readable update files, cached by (file, date, size) so a refresh only reads what is new."""
     out = []
     for path in patch_files_on_disk():
         try: st = os.stat(path)
@@ -200,7 +226,8 @@ def load_patches():
         if p is None or getattr(p, "_sig", None) != sig:
             p = load_patch(path); p._sig = sig; _PATCH_CACHE[path] = p
         out.append(p)
-    for k in [k for k in _PATCH_CACHE if k not in {x.path for x in out}]: _PATCH_CACHE.pop(k, None)
+    for k in [k for k in _PATCH_CACHE if k not in {x.path for x in out}]:
+        _PATCH_CACHE.pop(k, None)
     return sorted(out, key=lambda p: (p.key, p.name))
 
 
@@ -208,7 +235,6 @@ _HASH_CACHE = {}
 
 
 def disk_hashes(rels):
-    """rel path -> fingerprint of the file now in the folder (None = file does not exist)."""
     res = {}
     for rel in rels:
         p = path_of(rel)
@@ -222,25 +248,22 @@ def disk_hashes(rels):
     return res
 
 
-# ───────────────────────── the smart part: where is every file in the history of updates? ─────────────────────────
+# ─────────────────────────── graph / status ───────────────────────────
 class Graph:
-    """For every program file: which fingerprint can follow which (base -> new), as told by all the update files."""
     def __init__(self, patches):
-        self.parents = {}                      # rel -> {new_hash: {base_hash, ...}}
-        self.producers = {}                    # (rel, new_hash) -> [patch, ...]
+        self.parents = {}        # rel -> {new_hash: {base_hash, ...}}
+        self.producers = {}      # (rel, new_hash) -> [patch, ...]
         for p in patches:
             if p.error: continue
             for rel, b, n, mode in p.files:
                 self.parents.setdefault(rel, {}).setdefault(n, set())
                 if b: self.parents[rel][n].add(b)
                 self.producers.setdefault((rel, n), []).append(p)
-        self.known = {}                        # rel -> every fingerprint that any update mentions
-        for rel, d in self.parents.items():
-            self.known[rel] = set(d) | {b for bs in d.values() for b in bs}
+        self.known = {rel: set(d) | {b for bs in d.values() for b in bs}
+                      for rel, d in self.parents.items()}
         self._anc = {}
 
     def ancestors(self, rel, h):
-        """Every fingerprint that this file went through before it became h."""
         k = (rel, h)
         if k in self._anc: return self._anc[k]
         seen, stack = set(), [h]; par = self.parents.get(rel, {})
@@ -248,34 +271,38 @@ class Graph:
             x = stack.pop()
             for b in par.get(x, ()):
                 if b not in seen: seen.add(b); stack.append(b)
-        self._anc[k] = seen
-        return seen
+        self._anc[k] = seen; return seen
 
 
 def file_state(G, rel, b, n, mode, c):
-    """new | ready | sibling | waiting | missing | conflict   for one file of one update, given the file's fingerprint c."""
     if c is not None and c == n: return "new"
     A = G.ancestors(rel, c) if c is not None else set()
-    if n in A: return "new"                          # a newer update is already on top of this one
+    if n in A: return "new"
     if mode == "soft": return "ready"
     if mode == "new": return "ready" if c is None else "conflict"
-    if c is None: return "waiting" if (rel, b) in G.producers else "missing"      # created by an earlier update
+    if c is None:
+        return "waiting" if (rel, b) in G.producers else "missing"
     if c == b: return "ready"
-    if b in A: return "sibling"                      # another update that started from the same file replaced it
-    if c in G.ancestors(rel, b): return "waiting"    # the file is older than this update expects
-    if c in G.known.get(rel, ()) and (rel, b) not in G.producers: return "gap"   # an update in between is not in the folder
+    if b in A: return "sibling"
+    if c in G.ancestors(rel, b): return "waiting"
+    if c in G.known.get(rel, ()) and (rel, b) not in G.producers: return "gap"
     return "conflict"
 
 
 def judge(G, p, cur):
-    """(status, reason) of one update against the file state `cur` (rel -> fingerprint)."""
-    sts = [(rel, file_state(G, rel, b, n, mode, cur.get(rel))) for rel, b, n, mode in p.files]
+    # Deduplicate by rel+new for multi-base entries (each base entry is a separate row)
+    seen_rn = set(); sts = []
+    for rel, b, n, mode in p.files:
+        key = (rel, n)
+        if key in seen_rn: continue
+        seen_rn.add(key)
+        sts.append((rel, file_state(G, rel, b, n, mode, cur.get(rel))))
     kinds = {s for _, s in sts}
     names = lambda k: ", ".join(r.split("/")[-1] for r, s in sts if s == k)
     if kinds <= {"new"}: return "installed", "All files of this update are in place."
     if kinds <= {"new", "sibling"}: return "included", "A newer update that starts from the same files has replaced this one."
     if "conflict" in kinds: return "conflict", "Not a known version (edited by hand?): " + names("conflict")
-    if "gap" in kinds: return "blocked", "An earlier update that this one needs is not in the Patch folder (files: " + names("gap") + ")"
+    if "gap" in kinds: return "blocked", "An earlier update needed is not in the Patch folder: " + names("gap")
     if "missing" in kinds: return "conflict", "File missing: " + names("missing")
     if "sibling" in kinds: return "conflict", "Mixed versions: " + names("sibling")
     if "waiting" in kinds: return "waiting", "Needs an earlier update first: " + names("waiting")
@@ -283,8 +310,6 @@ def judge(G, p, cur):
 
 
 def analyze(patches=None, hashes=None):
-    """Work out the status of every update, and the install order for the ones that are missing.
-    Returns dict: items (list, newest first), plan (list of Patch in install order), current (label), summary counts."""
     patches = load_patches() if patches is None else patches
     good = [p for p in patches if not p.error]
     G = Graph(good)
@@ -294,26 +319,26 @@ def analyze(patches=None, hashes=None):
     for p in patches:
         if p.error: info[p.path] = {"status": "error", "reason": p.error, "plan": None, "needs": []}
         else:
-            st, why = judge(G, p, real); info[p.path] = {"status": st, "reason": why, "plan": None, "needs": []}
+            st, why = judge(G, p, real)
+            info[p.path] = {"status": st, "reason": why, "plan": None, "needs": []}
 
-    # --- simulate the installation: apply what can be applied, again and again, until nothing more can ---
     cur = dict(real); producer_of = {}; plan = []
     pending = [p for p in good if info[p.path]["status"] in ("ready", "waiting")]
     while pending:
         cands = [p for p in pending if judge(G, p, cur)[0] == "ready"]
         if not cands: break
-        # rivals: updates that start from the same file version but write different things (25 / 25.2 / 25.3).
-        # Only the best one is installed; the others are "included".
         group = {}
         for p in cands:
             for rel, b, n, mode in p.files:
-                if mode == "edit" and cur.get(rel) == b: group.setdefault((rel, b), []).append(p)
+                if mode == "edit" and cur.get(rel) == b:
+                    group.setdefault((rel, b), []).append(p)
         loser = {}
         for (_rel, _b), ps in group.items():
             if len(ps) < 2: continue
             def score(q):
                 new = {(r, h) for r, _b2, h, _m in q.files}
-                used = sum(1 for o in good if o is not q for r, b2, _h, _m in o.files if (r, b2) in new)
+                used = sum(1 for o in good if o is not q
+                           for r, b2, _h, _m in o.files if (r, b2) in new)
                 return (used, len(q.files), q.key)
             best = max(ps, key=score)
             for q in ps:
@@ -321,7 +346,8 @@ def analyze(patches=None, hashes=None):
         for lp, best in loser.items():
             q = next(x for x in cands if x.path == lp)
             if q in pending: pending.remove(q)
-            info[lp].update(status="included", reason="Replaced by %s, which starts from the same files and includes it." % best.label)
+            info[lp].update(status="included",
+                            reason="Replaced by %s (starts from the same files)." % best.label)
         cands = [p for p in cands if p.path not in loser]
         if not cands: continue
         p = min(cands, key=lambda q: (q.key, q.name))
@@ -330,28 +356,34 @@ def analyze(patches=None, hashes=None):
             if mode == "edit" and rel in producer_of and producer_of[rel] is not p:
                 if producer_of[rel] not in needs: needs.append(producer_of[rel])
         for rel, b, n, mode in p.files: cur[rel] = n; producer_of[rel] = p
-        plan.append(p); pending.remove(p); info[p.path]["plan"] = len(plan); info[p.path]["needs"] = needs
-    for p in pending:                                              # could not be placed in the plan
+        plan.append(p); pending.remove(p)
+        info[p.path]["plan"] = len(plan); info[p.path]["needs"] = needs
+
+    for p in pending:
         rec = info[p.path]
         if rec["status"] == "waiting":
             rec["status"] = "blocked"
-            rec["reason"] = "An earlier update that this one needs is not in the Patch folder. " + rec["reason"].split(": ", 1)[-1]
+            rec["reason"] = ("An earlier update needed is not in the Patch folder. "
+                             + rec["reason"].split(": ", 1)[-1])
     for p in plan:
         rec = info[p.path]
-        if rec["status"] == "waiting": rec["status"] = "queued"; rec["reason"] = "Will be installed after: " + (", ".join(q.label for q in rec["needs"]) or "earlier updates")
+        if rec["status"] == "waiting":
+            rec["status"] = "queued"
+            rec["reason"] = "Will be installed after: " + (
+                ", ".join(q.label for q in rec["needs"]) or "earlier updates")
 
     items = []
-    for p in sorted(patches, key=lambda q: (q.key, q.name), reverse=True):      # newest first
+    for p in sorted(patches, key=lambda q: (q.key, q.name), reverse=True):
         r = info[p.path]; items.append({"patch": p, **r})
     done = [it["patch"] for it in items if it["status"] in ("installed", "included")]
     current = max(done, key=lambda q: (q.key, q.name)).label if done else None
     count = {}
     for it in items: count[it["status"]] = count.get(it["status"], 0) + 1
-    return {"items": items, "plan": plan, "current": current, "count": count, "final": cur, "real": real, "graph": G}
+    return {"items": items, "plan": plan, "current": current, "count": count,
+            "final": cur, "real": real, "graph": G}
 
 
 def plan_for(result, patch):
-    """The updates to install so that `patch` can be installed: the ones it needs (and what they need), then itself."""
     rec = {it["patch"].path: it for it in result["items"]}
     if rec[patch.path]["plan"] is None: return []
     need, stack = set(), [patch]
@@ -362,22 +394,21 @@ def plan_for(result, patch):
     return [p for p in result["plan"] if p.path in need]
 
 
-# ───────────────────────── installing / undoing ─────────────────────────
+# ─────────────────────────── install / undo ───────────────────────────
 _last_stamp = {"s": 0}
 
 
 def _wait_new_second():
-    """Each install names its backup folder by the second: make sure two installs never share one."""
     while int(time.time()) == _last_stamp["s"]: time.sleep(0.1)
 
 
-def _run_patch(patch_path, args, py, timeout=900):
-    """Run an update file as if it were in the MiniCut folder (copy it there for the run, then delete the copy)."""
+def _run_patch(patch_path, py, timeout=900):
     tmp = os.path.join(ROOT, "_launcher_run_" + os.path.basename(patch_path))
     shutil.copy2(patch_path, tmp)
     try:
-        r = subprocess.run([py, tmp, "--no-pause"] + list(args), cwd=ROOT, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, creationflags=NOWIN)
+        r = subprocess.run([py, tmp, "--no-pause"], cwd=ROOT, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, creationflags=NOWIN)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     finally:
         try: os.remove(tmp)
@@ -386,11 +417,10 @@ def _run_patch(patch_path, args, py, timeout=900):
 
 def install_patch(patch, py, log):
     before = set(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else set()
-    _wait_new_second()
-    _last_stamp["s"] = int(time.time())
-    rc, out = _run_patch(patch.path, [], py)
+    _wait_new_second(); _last_stamp["s"] = int(time.time())
+    rc, out = _run_patch(patch.path, py)
     log(out.strip() or "(no output)")
-    if os.path.isdir(BACKUP_DIR):                          # remember which update file made the newest backup (for Undo)
+    if os.path.isdir(BACKUP_DIR):
         for d in set(os.listdir(BACKUP_DIR)) - before:
             try:
                 with open(os.path.join(BACKUP_DIR, d, "LAUNCHER.json"), "w", encoding="utf-8") as f:
@@ -400,7 +430,6 @@ def install_patch(patch, py, log):
 
 
 def list_backups():
-    """Installed updates that can still be undone, newest first (undone ones are marked MANIFEST.undone.json)."""
     if not os.path.isdir(BACKUP_DIR): return []
     out = []
     for d in sorted(os.listdir(BACKUP_DIR), reverse=True):
@@ -423,45 +452,42 @@ def last_backup_label():
 
 
 def undo_last(log):
-    """Put back the files of the newest installed update. Only the newest one can be undone, so the order stays right."""
     items = list_backups()
     if not items: log("Nothing to undo."); return False
-    stamp, man = items[0]
-    bdir = os.path.join(BACKUP_DIR, stamp)
+    stamp, man = items[0]; bdir = os.path.join(BACKUP_DIR, stamp)
     for rel in man.get("replaced", []):
         src = os.path.join(bdir, *rel.split("/")); dst = path_of(rel)
         shutil.copy2(src, dst); log("restored  " + rel)
     for rel in man.get("created", []):
         p = path_of(rel)
         if os.path.exists(p): os.remove(p); log("removed   " + rel)
-    os.rename(os.path.join(bdir, "MANIFEST.json"), os.path.join(bdir, "MANIFEST.undone.json"))
+    os.rename(os.path.join(bdir, "MANIFEST.json"),
+              os.path.join(bdir, "MANIFEST.undone.json"))
     log("Undone: %s (%s)" % (man["_launcher"].get("label") or man.get("patch", "?"), stamp))
     return True
 
 
 def start_minicut(debug=False):
-    """Start MiniCut. With the .venv from Run_MiniCut.bat it starts directly (no package check, so it is fast).
-    debug=True keeps a console window open so you can see MiniCut's own output while it runs."""
     venv_py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
     flags = (NEW_CONSOLE if debug else DETACHED) if IS_WIN else 0
     close = not debug
     if os.path.exists(venv_py) and os.path.exists(os.path.join(ROOT, "file.py")):
         subprocess.Popen([venv_py, "file.py"], cwd=ROOT, creationflags=flags, close_fds=close)
-        return "started MiniCut (.venv)" + (" [debug console]" if debug else "")
+        return "started MiniCut (.venv)" + (" [debug]" if debug else "")
     if IS_WIN and os.path.exists(os.path.join(ROOT, "Run_MiniCut.bat")):
-        subprocess.Popen(["cmd", "/c", "Run_MiniCut.bat"], cwd=ROOT, creationflags=0x00000010)   # new console
-        return "started Run_MiniCut.bat (it creates the .venv the first time)"
+        subprocess.Popen(["cmd", "/c", "Run_MiniCut.bat"], cwd=ROOT, creationflags=0x10)
+        return "started Run_MiniCut.bat"
     subprocess.Popen([sys.executable, "file.py"], cwd=ROOT, close_fds=close, creationflags=flags)
-    return "started with " + sys.executable + (" [debug console]" if debug else "")
+    return "started with " + sys.executable + (" [debug]" if debug else "")
 
 
 def folder_signature():
-    """Cheap fingerprint of the Patch folder + the program files the updates touch. Changes -> the list refreshes itself."""
     sig = []
     try:
         for n in sorted(os.listdir(PATCH_DIR)):
             if n.lower().startswith("apply_") and n.lower().endswith(".py"):
-                st = os.stat(os.path.join(PATCH_DIR, n)); sig.append((n, st.st_mtime_ns, st.st_size))
+                st = os.stat(os.path.join(PATCH_DIR, n))
+                sig.append((n, st.st_mtime_ns, st.st_size))
     except OSError: sig.append("nofolder")
     rels = {rel for p in _PATCH_CACHE.values() if not p.error for rel, *_ in p.files}
     for rel in sorted(rels):
@@ -470,9 +496,7 @@ def folder_signature():
     return hash(tuple(sig))
 
 
-# ───────────────────────── window ─────────────────────────
-# Colours taken from the MiniCut window itself (shared/theme.py: window #0e0e10, panel #1b1b1e, accent cyan #22d3ee, blue #2f7bff,
-# secondary text #9fb3d9), so the launcher looks like part of the program.
+# ─────────────────────────── colours ───────────────────────────
 BG        = "#0e0e10"
 PANEL     = "#1b1b1e"
 PANEL_HI  = "#26262a"
@@ -489,24 +513,25 @@ ORANGE_HI = "#ffb73d"
 GREEN     = "#22c55e"
 GREEN_HI  = "#54e085"
 RED       = "#ef4444"
+PURPLE    = "#a855f7"
+PURPLE_HI = "#c084fc"
 GRAY_BTN  = "#2a2a2e"
 GRAY_HI   = "#38383e"
 
-# status -> (chip text, colour)
 STATUS_STYLE = {
-    "ready":     ("Ready",      GREEN_HI),
-    "queued":    ("Queued",     BLUE_HI),
+    "ready":     ("Ready",       GREEN_HI),
+    "queued":    ("Queued",      BLUE_HI),
     "installed": ("✓ Installed", "#5f7a6a"),
-    "included":  ("Included",   SUBTEXT),
-    "blocked":   ("Blocked",    ORANGE_HI),
-    "conflict":  ("Conflict",   RED),
-    "error":     ("Error",      RED),
+    "included":  ("Included",    SUBTEXT),
+    "blocked":   ("Blocked",     ORANGE_HI),
+    "conflict":  ("Conflict",    RED),
+    "error":     ("Error",       RED),
 }
 
 
 def _hex_to_rgb(h):
     h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
 def _rgb_to_hex(rgb):
@@ -515,23 +540,25 @@ def _rgb_to_hex(rgb):
 
 def lerp_color(c1, c2, t):
     a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
-    return _rgb_to_hex(tuple(a[i] + (b[i] - a[i]) * t for i in range(3)))
+    return _rgb_to_hex(tuple(a[i] + (b[i]-a[i]) * t for i in range(3)))
 
 
 def nice_title(p):
-    """'MiniCut Patch 30: MEDIA FILTER GALLERY ...   (needs patch 29)'  ->  'Media filter gallery ...'"""
     t = p.title or p.name
-    t = re.sub(r"^\s*MiniCut\s*(update\s*)?(patch\s*[\d.]*)?\s*[:\-–—]?\s*", "", t, flags=re.I)
+    t = re.sub(r"^\s*MiniCut\s*(update\s*)?(patch\s*[\d.]*)?[\s:\-–—]*", "", t, flags=re.I)
     t = re.sub(r"\(\s*needs[^)]*\)", "", t, flags=re.I).strip(" :-–—")
     letters = [c for c in t if c.isalpha()]
-    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.6: t = t.capitalize()
+    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.6:
+        t = t.capitalize()
     return t or p.label
 
 
+# ─────────────────────────── GUI ───────────────────────────
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox
     from tkinter import font as tkfont
+    import math
 
     win = tk.Tk()
     win.title("MiniCut Launcher")
@@ -543,93 +570,182 @@ def run_gui():
 
     q = queue.Queue()
     busy = {"v": False}
-    state = {"result": None, "selected": None, "known": set(), "new_names": set(), "auto": True, "sig": None,
-             "analyzing": False, "again": False, "show_installed": True, "after_done": None, "checked": None}
+    state = {"result": None, "selected": None, "known": set(), "new_names": set(),
+             "auto": True, "sig": None, "analyzing": False, "again": False,
+             "show_installed": True, "after_done": None, "checked": None}
 
-    # ---- true rounded rectangle from 4 quarter-circle arcs + 2 rects ----
+    # ── animated particle background ──
+    class ParticleBg(tk.Canvas):
+        """Floating orbs + drifting grid lines, inspired by bc-minicut.netlify.app"""
+        N_ORBS   = 7
+        N_LINES  = 9
+        FPS      = 30
+
+        def __init__(self, parent):
+            tk.Canvas.__init__(self, parent, bg=BG, highlightthickness=0, bd=0)
+            import random, math
+            self._rng = random.Random(42)
+            self._t = 0.0
+            self._orbs  = [self._new_orb(i) for i in range(self.N_ORBS)]
+            self._lines = [self._new_line(i) for i in range(self.N_LINES)]
+            self._job   = None
+            self.bind("<Configure>", lambda _e: self._redraw())
+            self._tick()
+
+        def _new_orb(self, seed):
+            r = self._rng
+            return {
+                "cx": r.random(), "cy": r.random(),
+                "vx": (r.random()-0.5)*0.0004,
+                "vy": (r.random()-0.5)*0.0004,
+                "r":  r.uniform(60, 160),
+                "phase": r.random()*6.28,
+                "color": r.choice([CYAN, BLUE, PURPLE, GREEN]),
+                "alpha": r.uniform(0.04, 0.12),
+            }
+
+        def _new_line(self, seed):
+            r = self._rng
+            return {
+                "y": r.random(),
+                "vy": (r.random()-0.5)*0.0002,
+                "alpha": r.uniform(0.03, 0.09),
+                "color": r.choice([CYAN, BLUE]),
+            }
+
+        def _blend(self, hex_color, alpha):
+            """Blend color onto BG with given alpha (0–1)."""
+            fg = _hex_to_rgb(hex_color)
+            bg = _hex_to_rgb(BG)
+            return _rgb_to_hex(tuple(bg[i] + (fg[i]-bg[i])*alpha for i in range(3)))
+
+        def _radial_orb(self, cx, cy, r, color, alpha):
+            """Draw radial gradient orb using concentric ovals."""
+            steps = 8
+            for i in range(steps, 0, -1):
+                frac  = i / steps
+                a_frac = alpha * (1 - frac**2)
+                c = self._blend(color, a_frac)
+                rr = r * frac
+                self.create_oval(cx-rr, cy-rr, cx+rr, cy+rr,
+                                 fill=c, outline="", tags="bg")
+
+        def _redraw(self):
+            self.delete("bg")
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 10 or h < 10: return
+            import math
+            t = self._t
+
+            # drifting horizontal grid lines
+            for ln in self._lines:
+                y = (ln["y"] + t*ln["vy"]) % 1.0
+                yy = y * h
+                c = self._blend(ln["color"], ln["alpha"])
+                self.create_line(0, yy, w, yy, fill=c, width=1, tags="bg")
+
+            # glowing orbs
+            for orb in self._orbs:
+                pulse = 0.85 + 0.15 * math.sin(t * 0.8 + orb["phase"])
+                cx = (orb["cx"] + t*orb["vx"]) % 1.0 * w
+                cy = (orb["cy"] + t*orb["vy"]) % 1.0 * h
+                self._radial_orb(cx, cy, orb["r"]*pulse, orb["color"], orb["alpha"])
+
+            self.tag_lower("bg")
+
+        def _tick(self):
+            self._t += 1
+            self._redraw()
+            self._job = self.after(1000 // self.FPS, self._tick)
+
+        def stop(self):
+            if self._job: self.after_cancel(self._job); self._job = None
+
+    # ── drawing helpers ──
     def draw_round_rect(canvas, x1, y1, x2, y2, r, fill, outline="", width=1, tag=None):
-        r = max(1, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-        d = 2 * r
+        r = max(1, min(r, (x2-x1)/2, (y2-y1)/2)); d = 2*r
         kw = {"tags": tag} if tag else {}
-        fill_items = [
-            canvas.create_arc(x1, y1, x1 + d, y1 + d, start=90, extent=90, fill=fill, outline=fill, width=0, **kw),
-            canvas.create_arc(x2 - d, y1, x2, y1 + d, start=0, extent=90, fill=fill, outline=fill, width=0, **kw),
-            canvas.create_arc(x1, y2 - d, x1 + d, y2, start=180, extent=90, fill=fill, outline=fill, width=0, **kw),
-            canvas.create_arc(x2 - d, y2 - d, x2, y2, start=270, extent=90, fill=fill, outline=fill, width=0, **kw),
-            canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=fill, width=0, **kw),
-            canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=fill, width=0, **kw),
+        fi = [
+            canvas.create_arc(x1, y1, x1+d, y1+d, start=90,  extent=90,  fill=fill, outline=fill, width=0, **kw),
+            canvas.create_arc(x2-d, y1, x2, y1+d, start=0,   extent=90,  fill=fill, outline=fill, width=0, **kw),
+            canvas.create_arc(x1, y2-d, x1+d, y2, start=180, extent=90,  fill=fill, outline=fill, width=0, **kw),
+            canvas.create_arc(x2-d, y2-d, x2, y2, start=270, extent=90,  fill=fill, outline=fill, width=0, **kw),
+            canvas.create_rectangle(x1+r, y1, x2-r, y2, fill=fill, outline=fill, width=0, **kw),
+            canvas.create_rectangle(x1, y1+r, x2, y2-r, fill=fill, outline=fill, width=0, **kw),
         ]
-        border_items = []
+        bo = []
         if outline and width > 0:
-            border_items = [
-                canvas.create_arc(x1, y1, x1 + d, y1 + d, start=90, extent=90, style="arc", outline=outline, width=width, **kw),
-                canvas.create_arc(x2 - d, y1, x2, y1 + d, start=0, extent=90, style="arc", outline=outline, width=width, **kw),
-                canvas.create_arc(x1, y2 - d, x1 + d, y2, start=180, extent=90, style="arc", outline=outline, width=width, **kw),
-                canvas.create_arc(x2 - d, y2 - d, x2, y2, start=270, extent=90, style="arc", outline=outline, width=width, **kw),
-                canvas.create_line(x1 + r, y1, x2 - r, y1, fill=outline, width=width, **kw),
-                canvas.create_line(x1 + r, y2, x2 - r, y2, fill=outline, width=width, **kw),
-                canvas.create_line(x1, y1 + r, x1, y2 - r, fill=outline, width=width, **kw),
-                canvas.create_line(x2, y1 + r, x2, y2 - r, fill=outline, width=width, **kw),
+            bo = [
+                canvas.create_arc(x1, y1, x1+d, y1+d, start=90,  extent=90,  style="arc", outline=outline, width=width, **kw),
+                canvas.create_arc(x2-d, y1, x2, y1+d, start=0,   extent=90,  style="arc", outline=outline, width=width, **kw),
+                canvas.create_arc(x1, y2-d, x1+d, y2, start=180, extent=90,  style="arc", outline=outline, width=width, **kw),
+                canvas.create_arc(x2-d, y2-d, x2, y2, start=270, extent=90,  style="arc", outline=outline, width=width, **kw),
+                canvas.create_line(x1+r, y1, x2-r, y1, fill=outline, width=width, **kw),
+                canvas.create_line(x1+r, y2, x2-r, y2, fill=outline, width=width, **kw),
+                canvas.create_line(x1, y1+r, x1, y2-r, fill=outline, width=width, **kw),
+                canvas.create_line(x2, y1+r, x2, y2-r, fill=outline, width=width, **kw),
             ]
-        return fill_items, border_items
+        return fi, bo
 
-    # ---- rounded, animated button ----
+    # ── animated button ──
     class RoundedButton(tk.Canvas):
-        def __init__(self, parent, text, command, base, hi, fg="#06161a", w=170, h=40, radius=12, font_size=11, bold=True):
-            tk.Canvas.__init__(self, parent, width=w, height=h, bg=parent["bg"], highlightthickness=0, bd=0, cursor="hand2")
+        def __init__(self, parent, text, command, base, hi, fg="#06161a",
+                     w=170, h=40, radius=12, font_size=11, bold=True):
+            tk.Canvas.__init__(self, parent, width=w, height=h,
+                               bg=parent["bg"], highlightthickness=0, bd=0, cursor="hand2")
             self.command = command
             self.base, self.hi, self.fg = base, hi, fg
             self.w, self.h, self.radius = w, h, radius
-            self.enabled = True
-            self._cur = base
-            self._anim_job = None
-            self.fill_items, _ = draw_round_rect(self, 1, 1, w - 1, h - 1, radius, base)
-            self.label = self.create_text(w / 2, h / 2, text=text, fill=fg, font=("Segoe UI", font_size, "bold" if bold else "normal"))
-            self.bind("<Enter>", self._enter); self.bind("<Leave>", self._leave)
-            self.bind("<Button-1>", self._press); self.bind("<ButtonRelease-1>", self._release)
+            self.enabled = True; self._cur = base; self._job = None
+            self.fi, _ = draw_round_rect(self, 1, 1, w-1, h-1, radius, base)
+            fam = "Segoe UI" if IS_WIN else "Arial"
+            self.lbl = self.create_text(w/2, h/2, text=text, fill=fg,
+                                        font=(fam, font_size, "bold" if bold else "normal"))
+            self.bind("<Enter>",          self._enter)
+            self.bind("<Leave>",          self._leave)
+            self.bind("<Button-1>",       self._press)
+            self.bind("<ButtonRelease-1>",self._release)
 
-        def set_text(self, text): self.itemconfigure(self.label, text=text)
+        def set_text(self, t): self.itemconfigure(self.lbl, text=t)
 
-        def _set_fill(self, color):
-            for it in self.fill_items: self.itemconfigure(it, fill=color, outline=color)
-            self._cur = color
+        def _fill(self, c):
+            for it in self.fi: self.itemconfigure(it, fill=c, outline=c)
+            self._cur = c
 
         def set_enabled(self, v):
             self.enabled = v
-            if self._anim_job: self.after_cancel(self._anim_job); self._anim_job = None
-            self._set_fill(self.base if v else GRAY_BTN)
-            self.itemconfigure(self.label, fill=(self.fg if v else SUBTEXT))
+            if self._job: self.after_cancel(self._job); self._job = None
+            self._fill(self.base if v else GRAY_BTN)
+            self.itemconfigure(self.lbl, fill=(self.fg if v else SUBTEXT))
             self.configure(cursor="hand2" if v else "arrow")
 
-        def _animate_to(self, color, steps=8, delay=12):
-            if self._anim_job: self.after_cancel(self._anim_job)
+        def _anim(self, target, steps=8, delay=12):
+            if self._job: self.after_cancel(self._job)
             start = self._cur
             def step(i=0):
-                self._set_fill(lerp_color(start, color, i / steps))
-                if i < steps: self._anim_job = self.after(delay, lambda: step(i + 1))
+                self._fill(lerp_color(start, target, i/steps))
+                if i < steps: self._job = self.after(delay, lambda: step(i+1))
             step()
 
         def _enter(self, _e):
-            if self.enabled: self._animate_to(self.hi)
-
+            if self.enabled: self._anim(self.hi)
         def _leave(self, _e):
-            if self.enabled: self._animate_to(self.base)
-
+            if self.enabled: self._anim(self.base)
         def _press(self, _e):
             if self.enabled:
-                for it in self.fill_items + [self.label]: self.move(it, 0, 1)
-
+                for it in self.fi + [self.lbl]: self.move(it, 0, 1)
         def _release(self, e):
             if self.enabled:
-                for it in self.fill_items + [self.label]: self.move(it, 0, -1)
-                if 0 <= e.x <= self.w and 0 <= e.y <= self.h and self.command: self.command()
+                for it in self.fi + [self.lbl]: self.move(it, 0, -1)
+                if 0 <= e.x <= self.w and 0 <= e.y <= self.h and self.command:
+                    self.command()
 
     class IconButton(RoundedButton):
         def __init__(self, parent, glyph, command, size=34):
-            RoundedButton.__init__(self, parent, glyph, command, GRAY_BTN, GRAY_HI, fg=TEXT, w=size, h=size,
-                                   radius=size // 2, font_size=13, bold=False)
+            RoundedButton.__init__(self, parent, glyph, command, GRAY_BTN, GRAY_HI,
+                                   fg=TEXT, w=size, h=size, radius=size//2,
+                                   font_size=13, bold=False)
 
-    # ---- rounded panel: a rounded "card" that embeds a real child frame ----
     class RoundedPanel(tk.Canvas):
         def __init__(self, parent, radius=16, pad=14, fill=PANEL, outline=BORDER, height=None):
             kw = {"height": height} if height is not None else {}
@@ -643,30 +759,30 @@ def run_gui():
             w, h = self.winfo_width(), self.winfo_height()
             if w < 4 or h < 4: return
             self.delete("bg")
-            draw_round_rect(self, 1, 1, w - 1, h - 1, self.radius, self.fill, self.outline, 1, tag="bg")
+            draw_round_rect(self, 1, 1, w-1, h-1, self.radius, self.fill, self.outline, 1, tag="bg")
             self.tag_lower("bg")
             self.coords(self._win, self.pad, self.pad)
-            self.itemconfigure(self._win, width=max(1, w - 2 * self.pad), height=max(1, h - 2 * self.pad))
+            self.itemconfigure(self._win, width=max(1, w-2*self.pad), height=max(1, h-2*self.pad))
 
     class ProgressBar(tk.Canvas):
-        """Moving bar: only takes space while something is running."""
         def __init__(self, parent, height=6):
-            tk.Canvas.__init__(self, parent, height=0, bg=parent["bg"], highlightthickness=0, bd=0)
-            self.bar_height = height; self.running = False; self._pos = 0.0
+            tk.Canvas.__init__(self, parent, height=0, bg=parent["bg"],
+                               highlightthickness=0, bd=0)
+            self.bh = height; self.running = False; self._pos = 0.0
             self.bind("<Configure>", lambda _e: self._draw())
 
         def _draw(self):
             self.delete("all")
             if not self.running: return
-            w, h = self.winfo_width(), self.bar_height
+            w, h = self.winfo_width(), self.bh
             if w < 4: return
-            draw_round_rect(self, 0, 0, w, h, h / 2, BORDER)
-            seg = max(40, w * 0.22); x = self._pos * (w + seg) - seg
-            draw_round_rect(self, max(0, x), 0, min(w, x + seg), h, h / 2, GREEN)
+            draw_round_rect(self, 0, 0, w, h, h/2, BORDER)
+            seg = max(40, w*0.22); x = self._pos*(w+seg)-seg
+            draw_round_rect(self, max(0, x), 0, min(w, x+seg), h, h/2, GREEN)
 
         def start(self):
             if self.running: return
-            self.running = True; self.configure(height=self.bar_height); self._tick()
+            self.running = True; self.configure(height=self.bh); self._tick()
 
         def stop(self):
             self.running = False; self.configure(height=0); self.delete("all")
@@ -675,7 +791,7 @@ def run_gui():
             if not self.running: return
             self._pos = (self._pos + 0.02) % 1.0; self._draw(); self.after(20, self._tick)
 
-    # ---- the update list: one canvas, rounded cards, newest on top ----
+    # ── patch list ──
     class PatchList(tk.Frame):
         ROW_H, GAP, PAD = 60, 6, 6
 
@@ -684,28 +800,27 @@ def run_gui():
             self.on_select = on_select
             self.items, self.selected, self.new_names = [], None, set()
             self.canvas = tk.Canvas(self, bg=PANEL, highlightthickness=0, bd=0)
-            self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+            self.vsb   = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
             self.canvas.configure(yscrollcommand=self.vsb.set)
             self.vsb.pack(side="right", fill="y"); self.canvas.pack(side="left", fill="both", expand=True)
-            self.f_main = tkfont.Font(family="Segoe UI", size=11, weight="bold")
-            self.f_sub = tkfont.Font(family="Segoe UI", size=9)
-            self.f_chip = tkfont.Font(family="Segoe UI", size=9, weight="bold")
-            self._rows = []                       # per row: list of fill items
-            self._hover = None
+            fam = "Segoe UI" if IS_WIN else "Arial"
+            self.f_main = tkfont.Font(family=fam, size=11, weight="bold")
+            self.f_sub  = tkfont.Font(family=fam, size=9)
+            self.f_chip = tkfont.Font(family=fam, size=9, weight="bold")
+            self._rows = []; self._hover = None
             self.canvas.bind("<Configure>", lambda _e: self.redraw())
-            self.canvas.bind("<Button-1>", self._click)
-            self.canvas.bind("<Motion>", self._motion)
-            self.canvas.bind("<Leave>", lambda _e: self._set_hover(None))
+            self.canvas.bind("<Button-1>",  self._click)
+            self.canvas.bind("<Motion>",    self._motion)
             self.canvas.bind("<Enter>", lambda _e: self.canvas.bind_all("<MouseWheel>", self._wheel))
             self.canvas.bind("<Leave>", self._leave, add="+")
 
         def _leave(self, _e):
-            self._set_hover(None)
+            self._hover = None
             try: self.canvas.unbind_all("<MouseWheel>")
             except tk.TclError: pass
 
         def _wheel(self, e):
-            self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            self.canvas.yview_scroll(int(-1*(e.delta/120)), "units")
 
         def set_items(self, items, selected, new_names):
             self.items, self.selected, self.new_names = items, selected, new_names
@@ -715,10 +830,10 @@ def run_gui():
             if maxw <= 20 or font.measure(text) <= maxw: return text
             lo, hi = 0, len(text)
             while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if font.measure(text[:mid] + "…") <= maxw: lo = mid
-                else: hi = mid - 1
-            return text[:lo].rstrip() + "…"
+                mid = (lo+hi+1)//2
+                if font.measure(text[:mid]+"…") <= maxw: lo = mid
+                else: hi = mid-1
+            return text[:lo].rstrip()+"…"
 
         def _row_fill(self, i):
             it = self.items[i]
@@ -731,46 +846,50 @@ def run_gui():
             w = max(self.canvas.winfo_width(), 200)
             for i, it in enumerate(self.items):
                 p, st = it["patch"], it["status"]
-                top = self.PAD + i * (self.ROW_H + self.GAP); bot = top + self.ROW_H
+                top = self.PAD + i*(self.ROW_H+self.GAP); bot = top+self.ROW_H
                 sel = p.path == self.selected
-                fills, _ = draw_round_rect(self.canvas, 4, top, w - 8, bot, 12, self._row_fill(i), CYAN if sel else "", 1)
+                fills, _ = draw_round_rect(self.canvas, 4, top, w-8, bot, 12,
+                                           self._row_fill(i), CYAN if sel else "", 1)
                 self._rows.append(fills)
                 chip, col = STATUS_STYLE.get(st, (st, TEXT))
-                cx = w - 8 - 14
-                chip_w = self.f_chip.measure(chip) + 20
-                draw_round_rect(self.canvas, cx - chip_w, top + 10, cx, top + 30, 10, lerp_color(PANEL_HI, col, 0.22))
-                self.canvas.create_text(cx - chip_w / 2, top + 20, text=chip, fill=col, font=self.f_chip)
-                tail_x = cx - chip_w - 10
+                cx = w-8-14; chip_w = self.f_chip.measure(chip)+20
+                draw_round_rect(self.canvas, cx-chip_w, top+10, cx, top+30, 10,
+                                lerp_color(PANEL_HI, col, 0.22))
+                self.canvas.create_text(cx-chip_w/2, top+20, text=chip, fill=col, font=self.f_chip)
                 if it["plan"]:
-                    self.canvas.create_text(cx, top + 43, anchor="e", text="install step %d" % it["plan"], fill=SUBTEXT, font=self.f_sub)
-                self.canvas.create_oval(16, top + 14, 24, top + 22, fill=col, outline="")
-                label = p.label + ("   NEW" if p.name in self.new_names else "")
-                self.canvas.create_text(32, top + 18, anchor="w", text=self._fit(label, self.f_main, tail_x - 36),
-                                         fill=TEXT, font=self.f_main)
-                self.canvas.create_text(32, top + 42, anchor="w", text=self._fit(nice_title(p), self.f_sub, cx - 40),
-                                         fill=SUBTEXT, font=self.f_sub)
-                if p.name in self.new_names:
-                    pass
-            total = self.PAD * 2 + len(self.items) * (self.ROW_H + self.GAP)
+                    self.canvas.create_text(cx, top+43, anchor="e",
+                                            text="step %d" % it["plan"], fill=SUBTEXT, font=self.f_sub)
+                self.canvas.create_oval(16, top+14, 24, top+22, fill=col, outline="")
+                lbl = p.label + ("  NEW" if p.name in self.new_names else "")
+                self.canvas.create_text(32, top+18, anchor="w",
+                                        text=self._fit(lbl, self.f_main, cx-chip_w-36),
+                                        fill=TEXT, font=self.f_main)
+                self.canvas.create_text(32, top+42, anchor="w",
+                                        text=self._fit(nice_title(p), self.f_sub, cx-40),
+                                        fill=SUBTEXT, font=self.f_sub)
+            total = self.PAD*2 + len(self.items)*(self.ROW_H+self.GAP)
             self.canvas.configure(scrollregion=(0, 0, w, total))
             self.canvas.yview_moveto(y0)
 
         def _index_at(self, y):
-            yy = self.canvas.canvasy(y) - self.PAD
+            yy = self.canvas.canvasy(y)-self.PAD
             if yy < 0: return None
-            i = int(yy // (self.ROW_H + self.GAP))
-            return i if 0 <= i < len(self.items) and (yy % (self.ROW_H + self.GAP)) <= self.ROW_H else None
+            i = int(yy//(self.ROW_H+self.GAP))
+            return i if 0 <= i < len(self.items) and (yy%(self.ROW_H+self.GAP)) <= self.ROW_H else None
 
         def _set_hover(self, i):
             if i == self._hover: return
             old, self._hover = self._hover, i
             for idx in (old, i):
                 if idx is not None and idx < len(self._rows):
-                    for it in self._rows[idx]: self.canvas.itemconfigure(it, fill=self._row_fill(idx), outline=self._row_fill(idx))
+                    for it in self._rows[idx]:
+                        self.canvas.itemconfigure(it, fill=self._row_fill(idx),
+                                                  outline=self._row_fill(idx))
 
         def _motion(self, e):
             i = self._index_at(e.y)
-            self._set_hover(i); self.canvas.configure(cursor="hand2" if i is not None else "arrow")
+            self._set_hover(i)
+            self.canvas.configure(cursor="hand2" if i is not None else "arrow")
 
         def _click(self, e):
             i = self._index_at(e.y)
@@ -779,72 +898,101 @@ def run_gui():
         def scroll_to(self, path):
             for i, it in enumerate(self.items):
                 if it["patch"].path == path:
-                    total = self.PAD * 2 + len(self.items) * (self.ROW_H + self.GAP)
-                    self.canvas.yview_moveto(max(0.0, (self.PAD + i * (self.ROW_H + self.GAP) - 40) / max(1, total)))
+                    total = self.PAD*2 + len(self.items)*(self.ROW_H+self.GAP)
+                    self.canvas.yview_moveto(max(0.0, (self.PAD+i*(self.ROW_H+self.GAP)-40)/max(1, total)))
                     return
 
-    # ───────────────────────── layout ─────────────────────────
-    outer = tk.Frame(win, bg=BG)
-    outer.pack(fill="both", expand=True, padx=18, pady=14)
+    # ── layout ──
+    # Particle background fills the whole window; everything else floats on top
+    bg_canvas = ParticleBg(win)
+    bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-    title_row = tk.Frame(outer, bg=BG)
+    # Use a real BG frame on top of the canvas
+    outer = tk.Frame(win, bg=BG)
+    outer.place(x=0, y=0, relwidth=1, relheight=1)
+    outer.configure(bg=BG)
+    # Make outer semi-transparent (Windows only via attributes)
+    try: win.attributes("-transparentcolor", "")
+    except Exception: pass
+
+    # Re-do: particle bg drawn on a canvas placed behind a Frame
+    tk.Widget.lower(bg_canvas, outer)
+
+    pad_f = tk.Frame(outer, bg=BG)
+    pad_f.pack(fill="both", expand=True, padx=18, pady=14)
+
+    fam = "Segoe UI" if IS_WIN else "Arial"
+
+    # Title row
+    title_row = tk.Frame(pad_f, bg=BG)
     title_row.pack(fill="x")
-    tk.Label(title_row, text="MINICUT", font=("Segoe UI", 22, "bold"), fg=CYAN, bg=BG).pack(side="left")
-    tk.Label(title_row, text="Launcher", font=("Segoe UI", 22), fg=BLUE, bg=BG).pack(side="left", padx=(4, 0))
-    current_lbl = tk.Label(title_row, text="Current: —", font=("Segoe UI", 10, "bold"), fg=GREEN_HI, bg=BG)
+    tk.Label(title_row, text="MINICUT", font=(fam, 22, "bold"), fg=CYAN, bg=BG).pack(side="left")
+    tk.Label(title_row, text="Launcher", font=(fam, 22), fg=BLUE, bg=BG).pack(side="left", padx=(4,0))
+    current_lbl = tk.Label(title_row, text="Current: —", font=(fam, 10, "bold"), fg=GREEN_HI, bg=BG)
     current_lbl.pack(side="right")
 
-    # location + auto refresh
-    loc_panel = RoundedPanel(outer, radius=10, pad=10, fill=PANEL, height=40)
+    # Location bar
+    loc_panel = RoundedPanel(pad_f, radius=10, pad=10, fill=PANEL, height=40)
     loc_panel.pack(fill="x", pady=(8, 12))
-    tk.Label(loc_panel.inner, text="Location", font=("Segoe UI", 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
-    tk.Label(loc_panel.inner, text=ROOT, font=("Segoe UI", 9), fg=SUBTEXT, bg=PANEL).pack(side="left", padx=(10, 0))
-    auto_lbl = tk.Label(loc_panel.inner, text="", font=("Segoe UI", 9, "bold"), fg=GREEN_HI, bg=PANEL, cursor="hand2")
+    tk.Label(loc_panel.inner, text="Location", font=(fam, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+    tk.Label(loc_panel.inner, text=ROOT, font=(fam, 9), fg=SUBTEXT, bg=PANEL).pack(side="left", padx=(10,0))
+    auto_lbl = tk.Label(loc_panel.inner, text="", font=(fam, 9, "bold"), fg=GREEN_HI, bg=PANEL, cursor="hand2")
     auto_lbl.pack(side="right")
-    checked_lbl = tk.Label(loc_panel.inner, text="", font=("Segoe UI", 9), fg=SUBTEXT, bg=PANEL)
+    checked_lbl = tk.Label(loc_panel.inner, text="", font=(fam, 9), fg=SUBTEXT, bg=PANEL)
     checked_lbl.pack(side="right", padx=(0, 14))
 
-    # launch row
-    launch_row = tk.Frame(outer, bg=BG)
+    # Launch row
+    launch_row = tk.Frame(pad_f, bg=BG)
     launch_row.pack(fill="x", pady=(0, 12))
-    btn_start = RoundedButton(launch_row, "▶  Minicut Normal", None, CYAN, CYAN_HI, fg="#042024", w=230, h=46, radius=14, font_size=12)
+    btn_start = RoundedButton(launch_row, "▶  MiniCut Normal", None, CYAN, CYAN_HI,
+                               fg="#042024", w=230, h=46, radius=14, font_size=12)
     btn_start.pack(side="left")
-    btn_debug = RoundedButton(launch_row, "Minicut DEBUG", None, BLUE, BLUE_HI, fg="#0a1430", w=200, h=46, radius=14, font_size=12)
-    btn_debug.pack(side="left", padx=(10, 0))
+    btn_debug = RoundedButton(launch_row, "MiniCut DEBUG", None, BLUE, BLUE_HI,
+                               fg="#0a1430", w=200, h=46, radius=14, font_size=12)
+    btn_debug.pack(side="left", padx=(10,0))
+    btn_web = RoundedButton(launch_row, "🌐  Official Site", None, PURPLE, PURPLE_HI,
+                             fg="#1a0a30", w=180, h=46, radius=14, font_size=12)
+    btn_web.pack(side="left", padx=(10,0))
     icon_bar = tk.Frame(launch_row, bg=BG)
     icon_bar.pack(side="right")
-    btn_refresh_icon = IconButton(icon_bar, "⟳", None)
-    btn_refresh_icon.pack(side="left", padx=(0, 6))
+    btn_refresh_icon   = IconButton(icon_bar, "⟳", None)
+    btn_refresh_icon.pack(side="left", padx=(0,6))
     btn_openfolder_icon = IconButton(icon_bar, "⤴", None)
     btn_openfolder_icon.pack(side="left")
 
-    # smart banner
-    banner = RoundedPanel(outer, radius=14, pad=14, fill=PANEL, height=78)
+    # Smart update banner
+    banner = RoundedPanel(pad_f, radius=14, pad=14, fill=PANEL, height=78)
     banner.pack(fill="x", pady=(0, 12))
-    btn_smart = RoundedButton(banner.inner, "⚡  Smart Update", None, GREEN, GREEN_HI, fg="#042a0f", w=210, h=46, radius=14, font_size=12)
+    btn_smart = RoundedButton(banner.inner, "⚡  Smart Update", None, GREEN, GREEN_HI,
+                               fg="#042a0f", w=210, h=46, radius=14, font_size=12)
     btn_smart.pack(side="right")
     banner_txt = tk.Frame(banner.inner, bg=PANEL)
     banner_txt.pack(side="left", fill="x", expand=True)
-    banner_title = tk.Label(banner_txt, text="Checking updates…", font=("Segoe UI", 13, "bold"), fg=TEXT, bg=PANEL, anchor="w")
+    banner_title = tk.Label(banner_txt, text="Checking updates…", font=(fam, 13, "bold"),
+                             fg=TEXT, bg=PANEL, anchor="w")
     banner_title.pack(fill="x")
-    banner_sub = tk.Label(banner_txt, text="", font=("Segoe UI", 9), fg=SUBTEXT, bg=PANEL, anchor="w", justify="left")
+    banner_sub = tk.Label(banner_txt, text="", font=(fam, 9), fg=SUBTEXT, bg=PANEL,
+                           anchor="w", justify="left")
     banner_sub.pack(fill="x")
 
-    # bottom area is packed first (so it never gets pushed out), then the middle expands
-    bottom = tk.Frame(outer, bg=BG)
+    # Bottom (always visible)
+    bottom = tk.Frame(pad_f, bg=BG)
     bottom.pack(side="bottom", fill="x")
     prog = ProgressBar(bottom, height=6)
     prog.pack(fill="x", pady=(10, 0))
     actions = tk.Frame(bottom, bg=BG)
     actions.pack(fill="x", pady=(8, 0))
-    status_lbl = tk.Label(actions, text="Ready", font=("Segoe UI", 9), fg=SUBTEXT, bg=BG)
+    status_lbl = tk.Label(actions, text="Ready", font=(fam, 9), fg=SUBTEXT, bg=BG)
     status_lbl.pack(side="right")
-    btn_install_one = RoundedButton(actions, "Install Selected", None, GREEN, GREEN_HI, fg="#042a0f", w=170, h=42, radius=12, font_size=10)
+    btn_install_one = RoundedButton(actions, "Install Selected", None, GREEN, GREEN_HI,
+                                    fg="#042a0f", w=170, h=42, radius=12, font_size=10)
     btn_install_one.pack(side="left")
-    btn_undo = RoundedButton(actions, "Undo Last Update", None, ORANGE, ORANGE_HI, fg="#301a00", w=210, h=42, radius=12, font_size=10)
+    btn_undo = RoundedButton(actions, "Undo Last Update", None, ORANGE, ORANGE_HI,
+                              fg="#301a00", w=210, h=42, radius=12, font_size=10)
     btn_undo.pack(side="left", padx=10)
 
-    mid = tk.Frame(outer, bg=BG)
+    # Middle split
+    mid = tk.Frame(pad_f, bg=BG)
     mid.pack(fill="both", expand=True)
     mid.columnconfigure(0, weight=5, uniform="c")
     mid.columnconfigure(1, weight=6, uniform="c")
@@ -854,16 +1002,18 @@ def run_gui():
     list_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
     right = tk.Frame(mid, bg=BG)
     right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-    right.rowconfigure(0, weight=3); right.rowconfigure(1, weight=2); right.columnconfigure(0, weight=1)
+    right.rowconfigure(0, weight=3); right.rowconfigure(1, weight=2)
+    right.columnconfigure(0, weight=1)
     detail_panel = RoundedPanel(right, radius=16, pad=12, fill=PANEL)
     detail_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
     log_panel = RoundedPanel(right, radius=16, pad=12, fill=PANEL)
     log_panel.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
+    # Patch list header
     head = tk.Frame(list_panel.inner, bg=PANEL)
     head.pack(fill="x", pady=(0, 6))
-    tk.Label(head, text="Updates  ·  newest first", font=("Segoe UI", 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
-    show_lbl = tk.Label(head, text="", font=("Segoe UI", 9), fg=SUBTEXT, bg=PANEL, cursor="hand2")
+    tk.Label(head, text="Updates  ·  newest first", font=(fam, 10, "bold"), fg=TEXT, bg=PANEL).pack(side="left")
+    show_lbl = tk.Label(head, text="", font=(fam, 9), fg=SUBTEXT, bg=PANEL, cursor="hand2")
     show_lbl.pack(side="right")
 
     def on_pick(path):
@@ -874,38 +1024,35 @@ def run_gui():
     plist = PatchList(list_panel.inner, on_pick)
     plist.pack(fill="both", expand=True)
 
-    tk.Label(detail_panel.inner, text="Details", font=("Segoe UI", 10, "bold"), fg=TEXT, bg=PANEL).pack(anchor="w")
+    # Detail panel
+    tk.Label(detail_panel.inner, text="Details", font=(fam, 10, "bold"), fg=TEXT, bg=PANEL).pack(anchor="w")
     dwrap = tk.Frame(detail_panel.inner, bg=PANEL)
-    dwrap.pack(fill="both", expand=True, pady=(8, 0))
-    dtext = tk.Text(dwrap, wrap="word", font=("Segoe UI", 10), bg=PANEL_HI, fg=TEXT, relief="flat", padx=12, pady=8,
-                    state="disabled", cursor="arrow", highlightthickness=0)
+    dwrap.pack(fill="both", expand=True, pady=(8,0))
+    dtext = tk.Text(dwrap, wrap="word", font=(fam, 10), bg=PANEL_HI, fg=TEXT, relief="flat",
+                    padx=12, pady=8, state="disabled", cursor="arrow", highlightthickness=0)
     dvsb = ttk.Scrollbar(dwrap, orient="vertical", command=dtext.yview)
     dtext.configure(yscrollcommand=dvsb.set)
     dvsb.pack(side="right", fill="y"); dtext.pack(side="left", fill="both", expand=True)
-    dtext.tag_configure("h1", font=("Segoe UI", 13, "bold"), foreground=TEXT, spacing3=2)
-    dtext.tag_configure("file", font=("Consolas", 9), foreground=SUBTEXT, spacing3=6)
-    dtext.tag_configure("chip", font=("Segoe UI", 10, "bold"))
-    dtext.tag_configure("why", font=("Segoe UI", 10), foreground=TEXT, spacing1=4, spacing3=4, lmargin1=0, lmargin2=0)
-    dtext.tag_configure("sec", font=("Segoe UI", 10, "bold"), foreground=CYAN, spacing1=10, spacing3=2)
-    dtext.tag_configure("body", font=("Segoe UI", 9), foreground=SUBTEXT, lmargin1=6, lmargin2=20, spacing1=2, spacing3=2)
-    dtext.tag_configure("mono", font=("Consolas", 9), foreground=SUBTEXT, lmargin1=6, lmargin2=6)
+    dtext.tag_configure("h1",   font=(fam, 13, "bold"), foreground=TEXT,    spacing3=2)
+    dtext.tag_configure("file", font=("Consolas", 9),   foreground=SUBTEXT, spacing3=6)
+    dtext.tag_configure("chip", font=(fam, 10, "bold"))
+    dtext.tag_configure("why",  font=(fam, 10),         foreground=TEXT,    spacing1=4, spacing3=4)
+    dtext.tag_configure("sec",  font=(fam, 10, "bold"), foreground=CYAN,    spacing1=10, spacing3=2)
+    dtext.tag_configure("body", font=(fam, 9),          foreground=SUBTEXT, lmargin1=6, lmargin2=20, spacing1=2, spacing3=2)
+    dtext.tag_configure("mono", font=("Consolas", 9),   foreground=SUBTEXT, lmargin1=6, lmargin2=6)
 
-    tk.Label(log_panel.inner, text="Log", font=("Segoe UI", 10, "bold"), fg=TEXT, bg=PANEL).pack(anchor="w")
-    logbox = tk.Text(log_panel.inner, wrap="word", font=("Consolas", 9), bg=PANEL_HI, fg=TEXT, insertbackground=TEXT,
-                     relief="flat", padx=8, pady=8, highlightthickness=0)
-    logbox.pack(fill="both", expand=True, pady=(8, 0))
-    logbox.tag_configure("err", foreground=RED)
-    logbox.tag_configure("ok", foreground=GREEN_HI)
+    # Log panel
+    tk.Label(log_panel.inner, text="Log", font=(fam, 10, "bold"), fg=TEXT, bg=PANEL).pack(anchor="w")
+    logbox = tk.Text(log_panel.inner, wrap="word", font=("Consolas", 9), bg=PANEL_HI, fg=TEXT,
+                     insertbackground=TEXT, relief="flat", padx=8, pady=8, highlightthickness=0)
+    logbox.pack(fill="both", expand=True, pady=(8,0))
+    logbox.tag_configure("err",  foreground=RED)
+    logbox.tag_configure("ok",   foreground=GREEN_HI)
     logbox.tag_configure("info", foreground=CYAN)
 
-    all_buttons = [btn_start, btn_debug, btn_smart, btn_install_one, btn_undo, btn_refresh_icon, btn_openfolder_icon]
-
-    # ───────────────────────── behaviour ─────────────────────────
-    def log(msg, kind=None):
-        q.put((kind or "line", msg))
-
-    def result():
-        return state["result"]
+    # ── behaviour ──
+    def log(msg, kind=None): q.put((kind or "line", msg))
+    def result(): return state["result"]
 
     def selected_item():
         r = result()
@@ -918,8 +1065,8 @@ def run_gui():
         r = result()
         if not r: return []
         if state["show_installed"]: return r["items"]
-        keep = [it for it in r["items"] if it["status"] not in ("installed", "included") or it["patch"].path == state["selected"]]
-        return keep
+        return [it for it in r["items"]
+                if it["status"] not in ("installed","included") or it["patch"].path == state["selected"]]
 
     def render_list():
         plist.set_items(visible_items(), state["selected"], state["new_names"])
@@ -927,9 +1074,9 @@ def run_gui():
 
     def render_details():
         it = selected_item()
-        dtext.configure(state="normal"); dtext.delete("1.0", "end")
+        dtext.configure(state="normal"); dtext.delete("1.0","end")
         if not it:
-            dtext.insert("end", "Pick an update on the left to see what it changes.\n", ("body",))
+            dtext.insert("end", "Pick an update on the left to see its details.\n", ("body",))
             dtext.configure(state="disabled"); return
         p, st = it["patch"], it["status"]
         chip, col = STATUS_STYLE.get(st, (st, TEXT))
@@ -942,39 +1089,43 @@ def run_gui():
         if it["plan"]:
             total = len(r["plan"])
             needs = ", ".join(n.label for n in it["needs"])
-            dtext.insert("end", "Install step %d of %d%s\n" % (it["plan"], total, ("  ·  needs " + needs) if needs else ""), ("why",))
+            dtext.insert("end", "Install step %d of %d%s\n" % (
+                it["plan"], total, ("  ·  needs "+needs) if needs else ""), ("why",))
         if st == "conflict":
-            dtext.insert("end", "\nTo install it anyway (the files are backed up first), run in the MiniCut folder:\n", ("body",))
+            dtext.insert("end", "\nTo force-install (files are backed up first):\n", ("body",))
             dtext.insert("end", 'python "Patch\\%s" --force\n' % p.name, ("mono",))
         if p.body:
-            dtext.insert("end", "What changed\n", ("sec",)); dtext.insert("end", p.body + "\n", ("body",))
+            dtext.insert("end", "What changed\n", ("sec",))
+            dtext.insert("end", p.body + "\n", ("body",))
         if p.files:
-            dtext.insert("end", "Files (%d)\n" % len(p.files), ("sec",))
-            shown = [f[0] for f in p.files][:14]
-            dtext.insert("end", "\n".join(shown) + ("\n… and %d more" % (len(p.files) - 14) if len(p.files) > 14 else "") + "\n", ("mono",))
+            unique_rels = list(dict.fromkeys(f[0] for f in p.files))
+            dtext.insert("end", "Files (%d)\n" % len(unique_rels), ("sec",))
+            shown = unique_rels[:14]
+            extra = len(unique_rels) - 14
+            dtext.insert("end", "\n".join(shown) + ("\n… and %d more" % extra if extra > 0 else "") + "\n", ("mono",))
         dtext.configure(state="disabled"); dtext.yview_moveto(0)
 
     def render_banner():
         r = result()
         if not r: return
         plan, cnt = r["plan"], r["count"]
-        bad = cnt.get("conflict", 0) + cnt.get("blocked", 0) + cnt.get("error", 0)
+        bad = cnt.get("conflict",0) + cnt.get("blocked",0) + cnt.get("error",0)
         if not r["items"]:
             banner_title.configure(text="No update files in the Patch folder", fg=SUBTEXT)
-            banner_sub.configure(text="Drop apply_*.py files into the Patch folder (⤴) - the list refreshes by itself.")
+            banner_sub.configure(text="Drop apply_*.py files into the Patch folder — the list refreshes by itself.")
         elif plan:
             names = [p.label for p in plan]
-            order = " → ".join(names) if len(names) <= 6 else " → ".join(names[:3] + ["…"] + names[-2:])
-            banner_title.configure(text="%d update%s ready to install" % (len(plan), "" if len(plan) == 1 else "s"), fg=GREEN_HI)
-            banner_sub.configure(text="Smart order:  " + order + ("      ·  %d need attention" % bad if bad else ""))
+            order = " → ".join(names) if len(names) <= 6 else " → ".join(names[:3]+["…"]+names[-2:])
+            banner_title.configure(text="%d update%s ready to install" % (len(plan), "" if len(plan)==1 else "s"), fg=GREEN_HI)
+            banner_sub.configure(text="Smart order:  "+order + ("      ·  %d need attention" % bad if bad else ""))
         elif bad:
-            banner_title.configure(text="%d update%s need attention" % (bad, "" if bad == 1 else "s"), fg=ORANGE_HI)
-            first = next((it for it in r["items"] if it["status"] in ("conflict", "blocked", "error")), None)
+            banner_title.configure(text="%d update%s need attention" % (bad, "" if bad==1 else "s"), fg=ORANGE_HI)
+            first = next((it for it in r["items"] if it["status"] in ("conflict","blocked","error")), None)
             banner_sub.configure(text=("%s: %s" % (first["patch"].label, first["reason"])) if first else "")
         else:
-            banner_title.configure(text="You're up to date", fg=GREEN_HI)
+            banner_title.configure(text="You're up to date  ✓", fg=GREEN_HI)
             banner_sub.configure(text="Current: %s   ·   %d update files checked" % (r["current"] or "—", len(r["items"])))
-        banner_sub.configure(wraplength=max(300, banner.winfo_width() - 300))
+        banner_sub.configure(wraplength=max(300, banner.winfo_width()-300))
         btn_smart.set_text("⚡  Smart Update" + (" (%d)" % len(plan) if plan else ""))
 
     def render_header():
@@ -982,12 +1133,14 @@ def run_gui():
         current_lbl.configure(text="Current: " + ((r and r["current"]) or "—"))
         lb = last_backup_label()
         btn_undo.set_text("Undo Last Update" + (" (%s)" % lb if lb and len(lb) < 14 else ""))
-        auto_lbl.configure(text="● Auto-refresh ON" if state["auto"] else "○ Auto-refresh OFF", fg=GREEN_HI if state["auto"] else SUBTEXT)
+        auto_lbl.configure(text="● Auto ON" if state["auto"] else "○ Auto OFF",
+                           fg=GREEN_HI if state["auto"] else SUBTEXT)
         if state["checked"]: checked_lbl.configure(text="checked " + state["checked"])
 
     def update_buttons():
         r = result(); idle = not busy["v"]
-        for b in (btn_start, btn_debug, btn_refresh_icon, btn_openfolder_icon): b.set_enabled(idle)
+        for b in (btn_start, btn_debug, btn_web, btn_refresh_icon, btn_openfolder_icon):
+            b.set_enabled(idle)
         btn_smart.set_enabled(idle and bool(r and r["plan"]) and not state["analyzing"])
         it = selected_item()
         can_one = bool(idle and r and it and plan_for(r, it["patch"]) and not state["analyzing"])
@@ -1009,9 +1162,9 @@ def run_gui():
             for it in res["items"]:
                 if it["patch"].name in fresh:
                     state["new_names"].add(it["patch"].name)
-                    log("New update file found: %s  [%s]" % (it["patch"].name, STATUS_STYLE.get(it["status"], (it["status"],))[0]), "info")
-        gone = state["known"] - names
-        for n in sorted(gone): log("Update file removed: " + n, "info")
+                    log("New file: %s  [%s]" % (it["patch"].name,
+                        STATUS_STYLE.get(it["status"], (it["status"],))[0]), "info")
+        for n in sorted(state["known"] - names): log("Removed: " + n, "info")
         state["known"] = names
         if state["selected"] not in {it["patch"].path for it in res["items"]}:
             first = next((it for it in res["items"] if it["plan"]), None) or (res["items"][0] if res["items"] else None)
@@ -1025,7 +1178,6 @@ def run_gui():
         state["analyzing"] = True
         if not silent: status_lbl.configure(text="Checking…", fg=ORANGE_HI)
         update_buttons()
-
         def work():
             try:
                 res = analyze(); sig = folder_signature()
@@ -1049,25 +1201,26 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start(); set_busy(True)
 
     def confirm(text):
-        return messagebox.askokcancel("MiniCut", "Close MiniCut before you change the program files.\n\n" + text + "\n\nContinue?")
+        return messagebox.askokcancel("MiniCut",
+            "Close MiniCut before changing program files.\n\n" + text + "\n\nContinue?")
 
     def order_text(items):
-        lines = ["  %d.  %s" % (i + 1, p.label) for i, p in enumerate(items[:12])]
-        if len(items) > 12: lines.append("  … and %d more" % (len(items) - 12))
+        lines = ["  %d.  %s" % (i+1, p.label) for i, p in enumerate(items[:12])]
+        if len(items) > 12: lines.append("  … and %d more" % (len(items)-12))
         return "\n".join(lines)
 
     def do_install(items):
         if not items: return
-        if not confirm("Install %d update%s in this order:\n%s" % (len(items), "" if len(items) == 1 else "s", order_text(items))): return
-
+        if not confirm("Install %d update%s in this order:\n%s" % (
+                len(items), "" if len(items)==1 else "s", order_text(items))): return
         def work():
             py = python_for_minicut(); ok_all = True
             for i, p in enumerate(items):
-                log("== [%d/%d] Installing %s" % (i + 1, len(items), p.name), "info")
+                log("== [%d/%d] Installing %s" % (i+1, len(items), p.name), "info")
                 ok = install_patch(p, py, log)
                 log("== " + ("done" if ok else "FAILED") + ": " + p.label + "\n", "ok" if ok else "err")
                 if not ok: ok_all = False; break
-            if ok_all: log("All selected updates are installed. Start MiniCut as usual.", "ok")
+            if ok_all: log("All updates installed. Start MiniCut as usual.", "ok")
             state["after_done"] = "refresh"
         run_bg(work)
 
@@ -1081,14 +1234,18 @@ def run_gui():
 
     def do_undo():
         lb = last_backup_label()
-        if not confirm("Undo the last installed update%s.\nOnly files of that update are put back." % (" (%s)" % lb if lb else "")): return
-        def work():
-            undo_last(log); state["after_done"] = "refresh"
+        if not confirm("Undo the last installed update%s.\nOnly that update's files are restored." %
+                       (" (%s)" % lb if lb else "")): return
+        def work(): undo_last(log); state["after_done"] = "refresh"
         run_bg(work)
 
     def do_start(debug=False):
         try: log(start_minicut(debug=debug))
         except Exception as ex: messagebox.showerror("MiniCut", "Could not start MiniCut:\n%s" % ex)
+
+    def do_website():
+        webbrowser.open(WEBSITE)
+        log("Opened: " + WEBSITE, "info")
 
     def toggle_auto(_e=None):
         state["auto"] = not state["auto"]; render_header()
@@ -1103,15 +1260,16 @@ def run_gui():
             else: subprocess.Popen(["xdg-open", p])
         except Exception as ex: messagebox.showinfo("MiniCut", str(ex))
 
-    btn_start.command = lambda: do_start(False)
-    btn_debug.command = lambda: do_start(True)
-    btn_smart.command = do_smart
-    btn_install_one.command = do_one
-    btn_undo.command = do_undo
-    btn_refresh_icon.command = lambda: refresh()
-    btn_openfolder_icon.command = lambda: (patch_files_on_disk(), _open_folder(PATCH_DIR))
-    auto_lbl.bind("<Button-1>", toggle_auto)
-    show_lbl.bind("<Button-1>", toggle_installed)
+    btn_start.command          = lambda: do_start(False)
+    btn_debug.command          = lambda: do_start(True)
+    btn_web.command            = do_website
+    btn_smart.command          = do_smart
+    btn_install_one.command    = do_one
+    btn_undo.command           = do_undo
+    btn_refresh_icon.command   = lambda: refresh()
+    btn_openfolder_icon.command= lambda: (patch_files_on_disk(), _open_folder(PATCH_DIR))
+    auto_lbl.bind("<Button-1>",      toggle_auto)
+    show_lbl.bind("<Button-1>",      toggle_installed)
 
     def drain():
         pending = []
@@ -1122,33 +1280,39 @@ def run_gui():
             kind = m[0]
             if kind == "analysis": apply_result(m[1], m[2], m[3])
             elif kind == "analysis_fail":
-                state["analyzing"] = False; logbox.insert("end", "Could not read the updates: %s\n" % m[1], "err"); logbox.see("end"); update_buttons()
+                state["analyzing"] = False
+                logbox.insert("end", "Could not read updates: %s\n" % m[1], "err")
+                logbox.see("end"); update_buttons()
             elif kind == "done":
                 set_busy(False)
                 if state["after_done"] == "refresh": state["after_done"] = None; refresh()
-            elif kind in ("err", "ok", "info"):
-                logbox.insert("end", str(m[1]) + "\n", kind); logbox.see("end")
+            elif kind in ("err","ok","info"):
+                logbox.insert("end", str(m[1])+"\n", kind); logbox.see("end")
             else:
-                logbox.insert("end", str(m[1]) + "\n"); logbox.see("end")
+                logbox.insert("end", str(m[1])+"\n"); logbox.see("end")
         win.after(100, drain)
 
-    patch_files_on_disk()           # creates the Patch folder and its README on first start
+    patch_files_on_disk()
     render_header()
-    log("Put update files (apply_*.py) in the Patch folder - the list refreshes by itself.")
+    log("MiniCut Launcher ready. Drop apply_*.py files into the Patch folder.")
     drain(); refresh(); poll()
     win.mainloop()
+    try: bg_canvas.stop()
+    except Exception: pass
 
 
-# ───────────────────────── command line (testing) ─────────────────────────
+# ─────────────────────────── CLI ───────────────────────────
 def run_cli(args):
     py = python_for_minicut()
     def log(m): print(m, flush=True)
     cmd = args[0] if args else "status"
-    if cmd in ("status", "plan"):
+    if cmd in ("status","plan"):
         r = analyze()
         for it in r["items"]:
-            print("%-14s %-10s %s" % (it["patch"].label, it["status"], ("step %d" % it["plan"]) if it["plan"] else ""))
-        print("current:", r["current"], "| install order:", " -> ".join(p.label for p in r["plan"]) or "(nothing to install)")
+            print("%-14s %-10s %s" % (it["patch"].label, it["status"],
+                                       ("step %d" % it["plan"]) if it["plan"] else ""))
+        print("current:", r["current"], "| order:",
+              " -> ".join(p.label for p in r["plan"]) or "(nothing)")
     elif cmd == "install":
         r = analyze()
         if not r["plan"]: log("Nothing to install."); return 0
@@ -1162,5 +1326,5 @@ def run_cli(args):
 
 if __name__ == "__main__":
     if "--cli" in sys.argv:
-        sys.exit(run_cli(sys.argv[sys.argv.index("--cli") + 1:]))
+        sys.exit(run_cli(sys.argv[sys.argv.index("--cli")+1:]))
     run_gui()
