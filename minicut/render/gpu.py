@@ -176,9 +176,9 @@ uniform sampler2D u_tex;
 uniform float     u_opacity;
 void main() {
     vec4 c = texture(u_tex, v_uv);
-    // un-premultiply, apply opacity, re-premultiply for Porter-Duff over
+    // the texture holds straight (not premultiplied) colours: premultiply, apply opacity, for Porter-Duff over
     float a = c.a * u_opacity;
-    fragColor = vec4(c.rgb * u_opacity, a);
+    fragColor = vec4(c.rgb * a, a);
 }
 """
 
@@ -227,7 +227,7 @@ vec4 bicubic(sampler2D tex, vec2 uv, vec2 texel) {
 void main() {
     vec4 c = bicubic(u_tex, v_uv, u_texel);
     float a   = c.a * u_opacity;
-    fragColor = vec4(c.rgb * u_opacity, a);
+    fragColor = vec4(c.rgb * a, a);
 }
 """
 
@@ -624,6 +624,9 @@ class GpuState:
     def retry(self):
         """Test GPU button: forget the old result and probe again."""
         _write({})
+        try:                                  # Patch 35: the OpenGL effect chains get a fresh try as well
+            from . import glfx; glfx.reset()
+        except Exception: pass
         self.reset_requested = True
         self.status          = "testing ..."
 

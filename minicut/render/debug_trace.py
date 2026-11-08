@@ -5,7 +5,10 @@ _COUNTS = {}
 _LAST_SUMMARY = 0.0
 _LOG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "minicut_render_debug.log"))
 
+_ON = bool(os.environ.get("MINICUT_TRACE"))
+
 def trace_event(event, **fields):
+    if not _ON: return
     row = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
            "mono": round(time.perf_counter(), 4), "event": event, "thread": threading.current_thread().name}
     row.update(fields)
@@ -18,6 +21,7 @@ def trace_event(event, **fields):
 
 def trace_timing(event, ms, **fields):
     global _LAST_SUMMARY
+    if not _ON: return
     ms = float(ms)
     # Log all slow operations; aggregate fast calls so diagnostics do not themselves cause stutter.
     now = time.perf_counter()

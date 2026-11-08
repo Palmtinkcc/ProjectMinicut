@@ -114,10 +114,10 @@ def open_capture(path):
             except Exception: pass
 
 
-import threading
+import threading, collections
+PLAYING = [False]      # set by playback: background work (thumbnails, waveforms) waits while the preview plays
 PROXY_HEIGHT = 540
 PROXY_CHUNK = 2.0                 # seconds per proxy piece (pieces are finished one by one, in order)
-PROXY_JOB_TIMEOUT = 180           # seconds one ffmpeg call may take before the job is given up
 PROXY_RETRY_AFTER = 20.0          # seconds before a failed video is tried again
 
 
@@ -131,9 +131,6 @@ def proxy_dir(path, create=True):
     d = os.path.join(APP_DIR, "proxies", key)
     if create: os.makedirs(d, exist_ok=True)
     return d
-
-
-def _piece_path(d, k): return os.path.join(d, "p%05d.mp4" % k)
 
 
 def proxy_index(d):
@@ -608,6 +605,83 @@ def _make_reader(path, probe, fps, n, w, h):
     return _FFReader(path, fps, n, w, h, _Reader(probe), "%s|%dx%d" % (cc, w, h))
 
 
+class _Ahead:
+    """Decode-ahead wrapper (Patch 38). While the playhead moves forward frame by frame, a helper thread decodes (and, when a
+    target size is known, shrinks) the next frames, so the render thread never waits for the decoder. A jump (click, scrub)
+    stops the helper and the inner reader seeks at once, as before. Same interface as _Reader: read(idx) / release()."""
+    DEPTH = 3
+    def __init__(self, inner, n):
+        self.inner = inner; self.n = n; self.pos = -10; self.raw = None
+        self.cv = threading.Condition(); self.q = collections.deque(); self.th = None; self.stop = False; self.next = 0
+        self.hint = None; self.small = {}; self.err = 0
+    def _run(self, start, gen):
+        i = start
+        while True:
+            with self.cv:
+                while not self.stop and gen == self.gen and len(self.q) >= self.DEPTH: self.cv.wait(0.2)
+                if self.stop or gen != self.gen: return
+                hint = self.hint
+            if self.n > 0 and i >= self.n: return
+            try:
+                f = self.inner.read(i)
+                sm = None
+                if f is not None and hint and (f.shape[1], f.shape[0]) != hint:
+                    sm = cv2.resize(f, hint, interpolation=cv2.INTER_AREA if hint[0] < f.shape[1] else cv2.INTER_LINEAR)
+            except Exception:
+                f = None; sm = None
+            with self.cv:
+                if self.stop or gen != self.gen: return
+                if f is None: self.err += 1; self.q.append((i, None, None)); self.cv.notify_all(); return
+                self.q.append((i, f, sm)); self.cv.notify_all()
+            i += 1
+    def _halt(self):
+        with self.cv:
+            self.stop = True; self.gen += 1; self.cv.notify_all(); th = self.th
+        if th is not None and th is not threading.current_thread(): th.join(3.0)
+        self.th = None; self.q.clear(); self.small.clear(); self.stop = False
+    gen = 0
+    def _go(self, start):
+        self.q.clear(); self.gen += 1; g = self.gen
+        self.th = threading.Thread(target=self._run, args=(start, g), name="MiniCutDecodeAhead", daemon=True); self.th.start()
+    def want(self, tw, th):
+        self.hint = (tw, th)
+    def read(self, idx):
+        if self.n > 0: idx = max(0, min(self.n - 1, idx))
+        if idx == self.pos and self.raw is not None: return self.raw
+        gap = idx - self.pos
+        if self.err >= 3 or not (self.pos >= 0 and 1 <= gap <= 4):
+            self._halt()
+            f = self.inner.read(idx)
+            if f is not None: self.raw = f; self.pos = idx
+            self.small.clear()
+            return f if f is not None else self.raw
+        if self.th is None or not self.th.is_alive():
+            if self.th is not None and not self.q: self._halt()
+            if self.th is None: self._go(self.pos + 1)
+        t_end = time.monotonic() + 3.0
+        with self.cv:
+            while True:
+                while self.q and self.q[0][0] < idx: self.q.popleft(); self.cv.notify_all()
+                if self.q and self.q[0][0] == idx:
+                    _, f, sm = self.q.popleft(); self.cv.notify_all(); break
+                if self.q and self.q[0][0] > idx: f = None; sm = None; break
+                if (self.th is None or not self.th.is_alive()) or time.monotonic() > t_end: f = None; sm = None; break
+                self.cv.wait(0.05)
+        if f is None:
+            self._halt(); f = self.inner.read(idx)
+            if f is None: return self.raw
+            sm = None
+        self.raw = f; self.pos = idx; self.small = {idx: sm} if sm is not None else {}
+        return f
+    def small_for(self, idx, tw, th):
+        sm = self.small.get(idx)
+        return sm if sm is not None and sm.shape[1] == tw and sm.shape[0] == th else None
+    def release(self):
+        self._halt()
+        try: self.inner.release()
+        except Exception: pass
+
+
 class VideoSource:
     """Frames of a video. A finished proxy piece covering the time is used when there is one; otherwise the original
     file. Size, fps and length always come from the original file."""
@@ -619,12 +693,14 @@ class VideoSource:
         self.n = int(probe.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self.w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH)); self.h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.orig = _make_reader(path, probe, self.fps, self.n, self.w, self.h)
+        if not os.environ.get("MINICUT_NO_AHEAD"): self.orig = _Ahead(self.orig, self.n)
         self.dir = proxy_dir(path) if use_proxy else None
         if self.dir:
             try: os.utime(self.dir)                      # used now: keep it longest in the disk budget
             except OSError: pass
         self.index = []; self._starts = []; self._index_mt = None
         self.pieces = OrderedDict(); self.cache = OrderedDict(); self.rawc = OrderedDict()
+        self.path = path; self._warm = None; self._spare = None; self._warm_busy = False; self._wlock = threading.Lock()      # Patch 54: see prewarm()
     def _refresh_index(self):
         if self.dir is None: return
         try: mt = os.path.getmtime(os.path.join(self.dir, "index.csv"))
@@ -651,6 +727,45 @@ class VideoSource:
         self.pieces[name] = _Reader(cap)
         while len(self.pieces) > self.KEEP_PIECES: self.pieces.popitem(last=False)[1].release()
         return self.pieces[name]
+    def prewarm(self, idx):
+        """Patch 54: the playhead is about to enter a clip of this file at frame idx, which is NOT the frame after the one shown now (a cut that
+        was moved). A jump inside the file costs a seek to the keyframe plus decoding up to a whole GOP: that was the short freeze at every
+        join. So a second reader is moved there beforehand in a helper thread; raw_frame() swaps it in when the frame is asked for."""
+        if self.n > 0: idx = max(0, min(self.n - 1, idx))
+        pos = getattr(self.orig, "pos", -10)
+        if pos >= 0 and 0 <= idx - pos <= 8: return                       # the reader in use gets there by reading on: nothing to prepare
+        with self._wlock:
+            w = self._warm
+            if self._warm_busy or (w is not None and abs(w["idx"] - idx) <= 1): return
+            rd = None
+            if w is not None and w.get("r") is not None: rd = w["r"]       # an earlier guess that was not used: move that reader instead
+            if rd is None: rd, self._spare = self._spare, None
+            self._warm = w = {"idx": idx, "r": None, "ok": False}; self._warm_busy = True
+        def work():
+            r = rd; ok = False
+            try:
+                if r is None:
+                    probe = cv2.VideoCapture(safe_path(self.path)) if _ff_on() else open_capture(safe_path(self.path))
+                    if not probe.isOpened(): raise IOError("cannot open")
+                    r = _make_reader(self.path, probe, self.fps, self.n, self.w, self.h)
+                    if not os.environ.get("MINICUT_NO_AHEAD"): r = _Ahead(r, self.n)
+                ok = r.read(idx) is not None                                # the slow part: seek + decode the first frame
+            except Exception: ok = False
+            with self._wlock: w["r"] = r; w["ok"] = ok; self._warm_busy = False
+        threading.Thread(target=work, name="MiniCutPreRoll", daemon=True).start()
+    def _swap_warm(self, idx):
+        w = self._warm
+        if w is None or not w["ok"] or w["r"] is None: return
+        pos = getattr(self.orig, "pos", -10)
+        if idx == pos or (pos >= 0 and 1 <= idx - pos <= 4): return       # the reader in use serves it without a jump
+        r = w["r"]; rp = getattr(r, "pos", -10)
+        if not (rp >= 0 and 0 <= idx - rp <= 4): return                    # the playhead did not go where it was expected
+        with self._wlock:
+            old, self.orig = self.orig, r; self._warm = None
+            if self._spare is None: self._spare = old; old = None
+        if old is not None:
+            try: old.release()
+            except Exception: pass
     def raw_frame(self, t):
         """The decoded picture exactly as it is (BGR, no resize, no copy). The last few are kept, so asking again is free."""
         t = max(0.0, t); idx = int(t * self.fps + 1e-6)
@@ -663,10 +778,12 @@ class VideoSource:
         if pm:
             rd = self._piece(pm[0])
             if rd is not None: raw = rd.read(int(pm[1] * self.fps + 1e-6))
-        if raw is None: raw = self.orig.read(idx)
+        if raw is None:
+            if self._warm is not None: self._swap_warm(idx)                      # Patch 54
+            raw = self.orig.read(idx)
         if raw is None: raw = np.zeros((max(1, self.h), max(1, self.w), 3), np.uint8)
         self.rawc[key] = raw
-        while len(self.rawc) > 12: self.rawc.popitem(last=False)  # keep more decoded frames to reduce re-decodes on scrub
+        while len(self.rawc) > 4: self.rawc.popitem(last=False)  # keep more decoded frames to reduce re-decodes on scrub
         return raw
     def frame(self, t, ds=1.0):
         t = max(0.0, t); idx = int(t * self.fps + 1e-6)
@@ -682,8 +799,30 @@ class VideoSource:
         self.cache[key] = img
         while len(self.cache) > CFG["frame_cache"]: self.cache.popitem(last=False)
         return img
+    def frame_bgr(self, t, ds=1.0):
+        """Like frame() but 3-channel BGR (no alpha plane): what the effects use for video (Patch 34)."""
+        t = max(0.0, t); idx = int(t * self.fps + 1e-6)
+        if self.n > 0: idx = max(0, min(self.n - 1, idx))
+        pm = self._piece_for(t) if self.dir is not None else None
+        key = ("bgr", idx, ds, pm[0] if pm else None)
+        if key in self.cache: self.cache.move_to_end(key); return self.cache[key]
+        tw, th = max(1, int(self.w * ds)), max(1, int(self.h * ds))
+        if hasattr(self.orig, "want"): self.orig.want(tw, th)
+        raw = self.raw_frame(t)
+        sm = self.orig.small_for(idx, tw, th) if (pm is None and hasattr(self.orig, "small_for")) else None
+        if sm is not None: raw = sm
+        elif raw.shape[1] != tw or raw.shape[0] != th:
+            raw = cv2.resize(raw, (tw, th), interpolation=cv2.INTER_AREA if tw < raw.shape[1] else cv2.INTER_LINEAR)
+        self.cache[key] = raw
+        while len(self.cache) > CFG["frame_cache"]: self.cache.popitem(last=False)
+        return raw
     def close(self):
         for r in self.pieces.values(): r.release()
+        with self._wlock:
+            extra = [x for x in ((self._warm or {}).get("r"), self._spare) if x is not None]; self._warm = None; self._spare = None
+        for r in extra:
+            try: r.release()
+            except Exception: pass
         self.pieces.clear(); self.orig.release(); self.cache.clear(); self.rawc.clear()
 
 
@@ -769,12 +908,20 @@ class MediaPool:
     def get(self, c):
         if c.get("kind") == "compound": return self.make_compound(c) if self.make_compound else None
         p = c["path"]
+        if c.get("effects"):
+            from .smartkey import sk_path
+            p = sk_path(c) or p                                                    # Better Chroma Key: the rendered media is used while it is valid, else the original
         if p not in self.src:
-            try:
-                k = c["kind"]
-                self.src[p] = self._video(p) if k == "video" else GifSource(p) if k == "gif" else ImageSource(p) if k == "image" else None
-            except Exception as ex:
-                print("media error:", ex); self.src[p] = None
+            with self.__dict__.setdefault("_open_lock", threading.RLock()):         # Patch 54: a file may be opened by the pre-roll thread too
+                if p not in self.src:
+                    try:
+                        k = c["kind"]
+                        if k == "video" and p != c["path"]:
+                            from .smartkey import PackedAlphaSource
+                            self.src[p] = PackedAlphaSource(p)
+                        else: self.src[p] = self._video(p) if k == "video" else GifSource(p) if k == "gif" else ImageSource(p) if k == "image" else None
+                    except Exception as ex:
+                        print("media error:", ex); self.src[p] = None
         return self.src[p]
 
 
@@ -828,8 +975,10 @@ class AudioStore:
             if arr is not None:
                 hop = SR // 100; n = len(arr) // hop; pk = np.empty(n, np.float32)
                 for s in range(0, n, 6000):                 # one minute at a time: no big temporary arrays
-                    e = min(n, s + 6000); blk = np.asarray(arr[s * hop:e * hop]).astype(np.int32)
-                    pk[s:e] = np.abs(blk).max(axis=1).reshape(e - s, hop).max(axis=1) / 32768.0; time.sleep(0.001)      # lets the window draw in between
+                    # Patch 53: the old line took the max over the 2 channels (an axis of length 2: millions of tiny reductions) after copying everything
+                    # to int32. Now: one max and one min over long contiguous rows, on the int16 data as it is (same numbers, many times faster).
+                    e = min(n, s + 6000); blk = np.asarray(arr[s * hop:e * hop]).reshape(e - s, hop * 2)
+                    pk[s:e] = np.maximum(blk.max(axis=1).astype(np.int32), -blk.min(axis=1).astype(np.int32)) / 32768.0; _wait_idle(); time.sleep(0.002)      # lets the window draw in between
                 self.peaks[path] = pk
             else: self.peaks[path] = np.zeros(0, np.float32)
             return arr
@@ -838,12 +987,21 @@ class AudioStore:
 AUDIO = AudioStore()
 
 
+_THUMB_CAPS = OrderedDict(); _THUMB_LOCK = threading.Lock()
+
+
 def make_thumb(path, kind, t, h):
     img = None
     if kind == "video":
-        cap = cv2.VideoCapture(safe_path(path)); cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000); ok, img = cap.read()
-        if not ok: cap.set(cv2.CAP_PROP_POS_FRAMES, 0); ok, img = cap.read()
-        cap.release()
+        with _THUMB_LOCK:                        # Patch 38: the file stays open between thumbnails (opening a long file costs more than the seek)
+            cap = _THUMB_CAPS.pop(path, None)
+            if cap is None: cap = cv2.VideoCapture(safe_path(path))
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000); ok, img = cap.read()
+            if not ok: cap.set(cv2.CAP_PROP_POS_FRAMES, 0); ok, img = cap.read()
+            _THUMB_CAPS[path] = cap
+            while len(_THUMB_CAPS) > 2:
+                try: _THUMB_CAPS.popitem(last=False)[1].release()
+                except Exception: pass
         if not ok: return None
     elif kind == "image":
         img = to_bgra(imread_any(path))
@@ -858,12 +1016,20 @@ def make_thumb(path, kind, t, h):
     return np_to_qimage(img)
 
 
+def _wait_idle(limit=60.0):
+    """Background decoration (thumbnails, waveforms) does not compete with playback for the CPU / the interpreter lock."""
+    t0 = time.monotonic()
+    while PLAYING[0] and time.monotonic() - t0 < limit: time.sleep(0.1)
+
+
 class _Job(QRunnable):
     def __init__(self, fn, cb): super().__init__(); self.fn = fn; self.cb = cb
     def run(self):
+        _wait_idle()
         try: r = self.fn()
         except Exception: r = None
-        self.cb(r)
+        try: self.cb(r)
+        except RuntimeError: pass          # Qt objects already deleted at shutdown
 
 
 class ThumbStore(QObject):
@@ -876,6 +1042,8 @@ class ThumbStore(QObject):
         try: self.pool.setThreadPriority(QThread.LowPriority)
         except Exception: pass
         self.apool = QThreadPool(); self.apool.setMaxThreadCount(1)      # sound of the cards: one at a time, thumbnails are not held up
+        try: self.apool.setThreadPriority(QThread.LowPriority)           # Patch 53: reading the waveforms must not take the CPU from the preview
+        except Exception: pass
         self.ppool = QThreadPool(); self.ppool.setMaxThreadCount(1)      # sound of the file that is being previewed
     def _run(self, key, fn, pool=None, prio=0):
         self.pending.add(key)
@@ -887,7 +1055,8 @@ class ThumbStore(QObject):
                 if n >= 3: self.cache[key] = None
             else: self.cache[key] = r
             while len(self.cache) > 1500: self.cache.popitem(last=False)
-            self.updated.emit()
+            try: self.updated.emit()
+            except RuntimeError: pass          # the window was closed while the job was running
         (pool or self.pool).start(_Job(fn, cb), prio)
     def thumb(self, path, kind, t, h, urgent=False):
         key = ("t", path, round(t, 1), h)

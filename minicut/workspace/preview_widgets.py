@@ -9,7 +9,6 @@ import hashlib
 from ..render import fxcache
 
 
-
 def sample_frame(app, w=200):
     """A small BGRA picture to try effects on: what the viewport shows now, or a test card when it shows nothing."""
     img = getattr(getattr(app, "viewport", None), "img", None); arr = None
@@ -70,72 +69,6 @@ def _f(px, bold=False):
 
 
 _PREVIEW_CACHE = OrderedDict()          # (effect, picture) -> pixmap: opening the gallery again is instant
-_PREVIEW_CACHE_VERSION = 1               # bump when effect preview rendering semantics change
-_PREVIEW_DISK_MAX_FILES = 256
-_PREVIEW_DISK_MAX_BYTES = 128 * 1024 * 1024
-_PREVIEW_DISK_WRITES = 0
-
-
-def _preview_cache_dir():
-    """A shared, per-user disk cache; it lives outside project folders and is safe to delete."""
-    root = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(root, "MiniCut", "cache", "effect_previews")
-
-
-def _preview_disk_path(typ, sig):
-    # Include the effect definition/default parameters so changed defaults get a fresh cache entry.
-    effect = new_effect(typ)
-    meta = repr((typ, FX.get(typ, {}), effect.get("p", {}), _PREVIEW_CACHE_VERSION, sig)).encode("utf-8", "replace")
-    return os.path.join(_preview_cache_dir(), hashlib.sha256(meta).hexdigest() + ".png")
-
-
-def _trim_preview_disk_cache():
-    """Bound disk use and evict least-recently-used preview images first."""
-    root = _preview_cache_dir()
-    try:
-        files = [(os.path.getmtime(os.path.join(root, n)), os.path.getsize(os.path.join(root, n)), os.path.join(root, n))
-                 for n in os.listdir(root) if n.endswith(".png")]
-        total = sum(x[1] for x in files)
-        files.sort()  # oldest access first; hits refresh mtime
-        while files and (len(files) > _PREVIEW_DISK_MAX_FILES or total > _PREVIEW_DISK_MAX_BYTES):
-            _, size, path = files.pop(0)
-            try: os.remove(path); total -= size
-            except OSError: pass
-    except OSError:
-        pass
-
-
-def _load_disk_preview(typ, sig):
-    path = _preview_disk_path(typ, sig)
-    try:
-        pm = QPixmap(path)
-        if pm.isNull():
-            try: os.remove(path)
-            except OSError: pass
-            return None
-        try: os.utime(path, None)
-        except OSError: pass
-        return pm
-    except Exception:
-        return None
-
-
-def _save_disk_preview(typ, sig, pm):
-    global _PREVIEW_DISK_WRITES
-    try:
-        path = _preview_disk_path(typ, sig)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Write to a temporary file first so a crash cannot leave a partial PNG at the cache key.
-        tmp = path + ".tmp.png"
-        if pm.save(tmp, "PNG"):
-            os.replace(tmp, path)
-            _PREVIEW_DISK_WRITES += 1
-            if _PREVIEW_DISK_WRITES % 8 == 0: _trim_preview_disk_cache()
-        else:
-            try: os.remove(tmp)
-            except OSError: pass
-    except Exception as ex:
-        print("[effect-preview-cache] disk write skipped:", ex)
 
 
 class EffectPicker(QFrame):

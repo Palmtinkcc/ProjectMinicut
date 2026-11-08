@@ -7,7 +7,8 @@ from ..shared.core import *
 from ..shared.widgets import *
 from ..shared.ui import *
 from .preview_widgets import EffectPicker, fx_preview, sample_frame
-from ..render.effects import FX, FX_CATS, new_effect, fx_defaults, param_viz, SPILL_UNSUPPORTED
+from ..render.smartkey import visible_params as _sk_visible
+from ..render.effects import FX, FX_CATS, new_effect, fx_defaults, param_viz
 
 
 def _fx_key_value(e, key, lt, fallback):
@@ -30,11 +31,6 @@ def _fx_key_value(e, key, lt, fallback):
                 return QColor(round(ca.red() + (cb.red()-ca.red())*ease), round(ca.green()+(cb.green()-ca.green())*ease), round(ca.blue()+(cb.blue()-ca.blue())*ease), round(ca.alpha()+(cb.alpha()-ca.alpha())*ease)).name(QColor.HexArgb)
             return av if u < 1 else bv
     return track[-1]["v"]
-
-
-def _fmt(v, kind, lo, hi):
-    if kind == "int": return str(int(v))
-    return ("%.0f" % v) if (hi - lo) >= 60 else ("%.1f" % v).rstrip("0").rstrip(".")
 
 
 class EffectsPanel(QWidget):
@@ -75,6 +71,8 @@ class EffectsPanel(QWidget):
             else: kf["v"] = val
             tracks[key] = ks
         else: e["p"][key] = val
+        if e.get("type") == "smart_key" and key in ("mode", "edge_mode"):         # which rows the card shows depends on these two
+            QTimer.singleShot(0, lambda: self._rebuild(self.app.sel_clip()))
         self._ct.start(); self.app.preview_fast_for(0.2)
         # Parameter edits must invalidate the RenderWorker's snapshot/version as well as the frame cache.
         try: self.app.renderer.clear_preview_cache()
@@ -226,11 +224,8 @@ class EffectsPanel(QWidget):
         h.addLayout(r2)
         ka = tool("", "Add/remove keyframes for every parameter in this filter", lambda eid=eid: self._key_all_one(eid), icon="diamond", isize=16)
         r2.addWidget(ka); v.addLayout(h); info["enable"] = cb
-        if e["type"] in SPILL_UNSUPPORTED:           # Patch 46: these look different on a bigger layer, so they always stay inside the media
-            info["spill"] = Toggle("", False)
-        else:
-            sp = Toggle("Spill outside the media", bool(e.get("spill", False)), "Off: the effect stays inside the edges of the media (cropped). On: it may go beyond the edges (glow, blur, shadows ...). The picture inside the media looks the same either way.")
-            sp.toggled.connect(lambda on, eid=eid: self._set_spill(eid, on)); v.addWidget(sp); info["spill"] = sp
+        sp = Toggle("Spill outside the media", bool(e.get("spill", False)), "Off: the effect is cut at the edges of the media. On: the effect may be drawn beyond the edges of the media (the media itself keeps its size).")
+        sp.toggled.connect(lambda on, eid=eid: self._set_spill(eid, on)); v.addWidget(sp); info["spill"] = sp
         if FX[e["type"]].get("help"):
             hl = QLabel(FX[e["type"]]["help"]); hl.setWordWrap(True); hl.setStyleSheet("color:#8d8d99;font-size:11px;background:transparent;border:none;"); v.insertWidget(1, hl)
         def std(key, label_, kind, dflt, lo, hi):          # one parameter as a slider row (as before)
@@ -266,13 +261,16 @@ class EffectsPanel(QWidget):
             row.addWidget(kd); info.setdefault("keydots", {})[key] = kd
             v.addLayout(row); info["set"][key] = (setter, dflt)
 
-        for item in fx_controls.plan(e["type"], spec["params"]):      # Patch 47: angles, spin speeds and 3D objects get round controls
+        for item in fx_controls.plan(e["type"], _sk_visible(e, spec["params"]) if e["type"] == "smart_key" else spec["params"]):      # Patch 47: angles, spin speeds and 3D objects get round controls
             if item[0] == "std": std(*item[1]); continue
             try: fx_controls.build(self, v, e, info, item)
             except Exception as ex:                                  # anything wrong: the normal slider rows
                 print("[fx_controls]", ex)
                 for cell in item[2]:
                     for prm in fx_controls.cell_params(cell): std(*prm)
+        if e["type"] == "smart_key":
+            from . import smartkey_ui
+            smartkey_ui.build(self, v, e, info)
         if spec["area"]:
             ab = Btn("Choose the area", "vignette", "soft", "Choose the blurred area: a shape, or draw your own with the Custom shape", None, True); ab.setChecked(self._area_id == eid)
             ab.toggled.connect(lambda on, eid=eid: self._edit_area(eid, on)); v.addWidget(ab); info["area_btn"] = ab

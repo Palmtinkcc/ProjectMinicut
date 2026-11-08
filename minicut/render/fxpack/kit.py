@@ -2,7 +2,7 @@
 Every effect works on an 8-bit BGRA picture (h, w, 4). Sizes in the parameters are in layer pixels: S(ctx, v) turns them into
 picture pixels, so the small preview looks like the export."""
 from ...shared.deps import *
-from ..effects import register as _register, _premul, _unpremul, _gauss, blur_bgra, ref_size, ref_crop
+from ..effects import register as _register, _premul, _unpremul, _gauss, blur_bgra, ref_size, ref_crop, ref_origin
 
 _GRID = {}
 _NZ = OrderedDict()
@@ -78,11 +78,15 @@ def fbm(h, w, scale, seed=1, t=0.0, octaves=4):
 
 # ------------------------------------------------------------------ colour
 def bgr(col): c = QColor(col); return np.array([c.blueF(), c.greenF(), c.redF()], np.float32)
-def f3(img): return img[..., :3].astype(np.float32) * (1 / 255)
+def f3(img): return np.multiply(img[..., :3], np.float32(1 / 255), dtype=np.float32)       # one pass (was astype + multiply); same numbers
 def lum(f): return f @ np.array([0.114, 0.587, 0.299], np.float32)
 def pack(rgb, alpha=None, like=None):
     """float BGR 0..1 (+ alpha 0..1 or uint8) -> BGRA uint8. The alpha of `like` is kept when no alpha is given."""
-    h, w = rgb.shape[:2]; out = np.empty((h, w, 4), np.uint8); out[..., :3] = np.clip(rgb * 255 + .5, 0, 255).astype(np.uint8)
+    h, w = rgb.shape[:2]; out = np.empty((h, w, 4), np.uint8)
+    if rgb.dtype == np.float32 and rgb.ndim == 3 and h * w > 100000:         # the same sum, done in bands that stay in the CPU cache (no big temporaries)
+        for y0 in range(0, h, _BAND):
+            t = rgb[y0:y0 + _BAND] * np.float32(255); t += np.float32(.5); np.clip(t, 0, 255, out=t); out[y0:y0 + _BAND, :, :3] = t
+    else: out[..., :3] = np.clip(rgb * 255 + .5, 0, 255).astype(np.uint8)
     if alpha is None: out[..., 3] = like[..., 3] if like is not None else 255
     elif alpha.dtype == np.uint8: out[..., 3] = alpha
     else: out[..., 3] = np.clip(alpha * 255 + .5, 0, 255).astype(np.uint8)
@@ -100,14 +104,26 @@ def ramp(vals, stops):
 
 
 # ------------------------------------------------------------------ blending
+_BAND = 48            # rows per band for the cache-friendly versions below (a band of float32 stays inside the CPU cache)
 def blend(img, pat, pa=None, mode="over", opacity=1.0):
-    """Put a generated picture (float BGR, optional alpha 0..1) onto the picture with a blend mode."""
+    """Put a generated picture (float BGR, optional alpha 0..1) onto the picture with a blend mode. Big pictures are done band by band
+    (every step is per pixel, so the numbers are exactly the same, only much less memory is pushed around)."""
+    h, w = img.shape[:2]
+    if h * w > 100000 and getattr(pat, "ndim", 0) == 3 and pat.shape[:2] == (h, w) and (pa is None or getattr(pa, "shape", None) == (h, w)):
+        out = np.empty((h, w, 4), np.uint8)
+        for y0 in range(0, h, _BAND): out[y0:y0 + _BAND] = _blend(img[y0:y0 + _BAND], pat[y0:y0 + _BAND], None if pa is None else pa[y0:y0 + _BAND], mode, opacity)
+        return out
+    return _blend(img, pat, pa, mode, opacity)
+def _blend(img, pat, pa=None, mode="over", opacity=1.0):
     base = f3(img); ia = img[..., 3].astype(np.float32) * (1 / 255); pa = np.ones(ia.shape, np.float32) if pa is None else pa; op = float(opacity)
     if mode == "replace": rgb = base * (1 - op * pa[..., None]) + pat * (op * pa[..., None]); al = np.maximum(ia, op * pa)
     elif mode == "behind":
         w_ = (pa * (1 - ia))[..., None] * op; rgb = (base * ia[..., None] + pat * w_) / np.maximum(ia[..., None] + w_, 1e-4); al = np.clip(ia + w_[..., 0], 0, 1)
-    elif mode == "add": rgb = base + pat * (pa[..., None] * op); al = ia
-    elif mode == "screen": rgb = 1 - (1 - base) * (1 - pat * (pa[..., None] * op)); al = ia
+    elif mode in ("add", "screen"):
+        # Light is new picture: where the media is see-through it must show too (Porter-Duff on premultiplied colours), so its alpha grows
+        # with the brightness of the light. On opaque pixels the result is exactly the old add / screen.
+        light = pat * (pa[..., None] * op); m = np.clip(np.maximum(np.maximum(light[..., 0], light[..., 1]), light[..., 2]), 0, 1); al = ia + m - ia * m; bp = base * ia[..., None]
+        pm = bp + light if mode == "add" else bp + light - bp * np.clip(light, 0, 1); rgb = pm / np.maximum(al[..., None], 1e-4)
     elif mode == "multiply": rgb = base * (1 - pa[..., None] * op) + base * pat * (pa[..., None] * op); al = ia
     elif mode == "overlay":
         o = np.where(base < 0.5, 2 * base * pat, 1 - 2 * (1 - base) * (1 - pat)); rgb = base + (o - base) * (pa[..., None] * op); al = ia

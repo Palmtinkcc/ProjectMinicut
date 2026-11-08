@@ -127,6 +127,9 @@ def main():
         win.settings["migrated_v21"] = True
         if win.settings["play_reduce"]: win.settings["play_reduce"] = False
         win.settings.save()
+    try:
+        from . import paintguard; paintguard.install()
+    except Exception: pass
     win.show(); sys.exit(app.exec())
 
 

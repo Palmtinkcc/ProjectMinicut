@@ -22,7 +22,7 @@ NODE TYPES available in the FX node editor:
 """
 from ..effects import FX, register as _register_fx
 from ..fxpack.kit import *
-import json, os, hashlib, re, textwrap, types, traceback
+import json, os, hashlib, re, types, traceback
 
 CUSTOM_FX_DIR = os.path.join(os.path.expanduser("~"), ".minicut", "custom_effects")
 CUSTOM_CATEGORIES_FILE = os.path.join(CUSTOM_FX_DIR, "_categories.json")
@@ -639,11 +639,6 @@ def _safe_id(s: str) -> str:
     return re.sub(r"[^a-z0-9_]", "_", s.lower())
 
 
-def _out_kind(spec):
-    """What a node's output socket carries: 'image', 'float' or 'color' (None = no output)."""
-    return spec.get("out_type") if spec.get("outs") else None
-
-
 def _coerce_param(ps, raw):
     """A node parameter as a safe Python value of its declared kind (numbers are clamped to the declared range).
     Only these values ever reach the generated code, so a hand-edited or imported .mcfx cannot inject code."""
@@ -704,10 +699,6 @@ def _fx_pb(p, key, dflt): return bool(p.get(key, dflt))
 def _fx_pcol(p, key, dflt):               # exposed colour
     v = p.get(key, dflt); v = str(v)
     return v if _HEX_COLOR.match(v) else dflt
-
-
-def _expr_const(ps, value):
-    return value
 
 
 _FX_HELPERS.update({"_fx_cf": _fx_cf, "_fx_ci": _fx_ci, "_fx_pf": _fx_pf, "_fx_pi": _fx_pi,

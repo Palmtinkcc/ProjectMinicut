@@ -5,7 +5,7 @@ from ..shared.theme import *
 from ..shared.core import *
 from ..shared.core import _group_ids
 from .timeline_ops import (trim_l_bounds, trim_r_bounds, neighbor_before, neighbor_after, touches,
-                            propagate_group_delta, close_gaps as _close_gaps, vol_to_y, y_to_vol)
+                            propagate_group_delta, vol_to_y, y_to_vol)
 from ..shared.widgets import *
 from ..shared.ui import *
 from ..render.media import proxy_pieces, proxy_sources, proxy_runs, PROXY_CHUNK
@@ -91,7 +91,7 @@ class Timeline(QWidget):
         p.restore(); p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor("#ff3b4f"), 2)); p.drawRoundedRect(rc, UI["tl_radius"], UI["tl_radius"])
     def _paint_core(self, ev):
         if not self.app.proj: return
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); W, H = self.width(), self.height()
+        p = QPainter(self._dev or self); p.setRenderHint(QPainter.Antialiasing); W, H = self.width(), self.height()
         p.fillRect(self.rect(), QColor(UI["tl_bg"])); lanes = self.lanes(); lane_of = {tr["id"]: (y, h) for tr, y, h in lanes}
         p.setClipRect(QRect(self.HEAD, self.RULER, W - self.HEAD, H - self.RULER))
         for tr, y, h in lanes: p.fillRect(QRectF(self.HEAD, y, W, h), QColor(UI["tl_lane_video"] if tr["kind"] == "video" else UI["tl_lane_audio"]))
@@ -109,11 +109,7 @@ class Timeline(QWidget):
         p.fillRect(QRect(0, self.RULER, self.HEAD, H), QColor(UI["tl_bg"]))
         for tr, y, h in lanes: self.draw_header(p, tr, y, h)
         p.setClipping(False); self.draw_ruler(p, W); self.draw_proxy_strip(p, W)
-        x = self.t2x(self.app.t)
-        if x >= self.HEAD:
-            p.setPen(QPen(QColor(UI["tl_playhead"]), float(UI["tl_playhead_w"]))); p.drawLine(QPointF(x, self.RULER - 4), QPointF(x, H))
-            p.setPen(Qt.NoPen); p.setBrush(QColor(UI["tl_playhead_head"]))
-            p.drawPolygon(QPolygonF([QPointF(x - 6, 4), QPointF(x + 6, 4), QPointF(x + 6, 16), QPointF(x, 24), QPointF(x - 6, 16)]))
+        if not getattr(self, "_hide_ph", False): self._draw_playhead(p, H)
         d = self.drag
         if d and d.get("mode") == "marquee" and d.get("moved"):
             rr = QRectF(QPointF(d["x0"], d["y0"]), QPointF(d["x"], d["y"])).normalized()
@@ -355,7 +351,7 @@ class Timeline(QWidget):
         vk = c["props"]["volume"]["k"]; vconst = c["props"]["volume"]["v"] / 100
         for xi in range(x0, x1, 2):
             lt = (xi - band.left()) / self.pps
-            a = self._compound_amp(c, c["inp"] + lt, gain)
+            a = self._compound_amp(c, src_time(c, lt), gain)          # Patch 53: follows the speed of the compound
             if a <= 0: continue
             a = min(1.0, a * (prop_at(c, "volume", lt) / 100 if vk else vconst)) * amp
             lines.append(QLineF(xi, mid - a, xi, mid + a))
@@ -710,7 +706,7 @@ class Timeline(QWidget):
         self._proxy_states(); P = self.app.proj
         if not P: return
         use = getattr(self.app.pool, "use_proxy", False)
-        p = QPainter(self); p.setPen(Qt.NoPen); W = self.width(); y = self.RULER - 5
+        p = QPainter(self._dev or self); p.setPen(Qt.NoPen); W = self.width(); y = self.RULER - 5
         for c, off in proxy_sources(P.clips):
             k = c.get("kind")
             if k not in ("video", "image", "gif"): continue
@@ -728,12 +724,42 @@ class Timeline(QWidget):
                 px0 = max(self.HEAD, self.t2x(s + local_of_src(c, a - inp))); px1 = min(W, self.t2x(s + local_of_src(c, b - inp)))
                 if px1 > px0: p.drawRect(QRectF(px0, y, px1 - px0, 3))
         p.end()
+    _dev = None; _hide_ph = False; _pc = None; _pc_sig = None
+    def _draw_playhead(self, p, H):
+        x = self.t2x(self.app.t)
+        if x >= self.HEAD:
+            p.setPen(QPen(QColor(UI["tl_playhead"]), float(UI["tl_playhead_w"]))); p.drawLine(QPointF(x, self.RULER - 4), QPointF(x, H))
+            p.setPen(Qt.NoPen); p.setBrush(QColor(UI["tl_playhead_head"]))
+            p.drawPolygon(QPolygonF([QPointF(x - 6, 4), QPointF(x + 6, 4), QPointF(x + 6, 16), QPointF(x, 24), QPointF(x - 6, 16)]))
+    def _static_sig(self):
+        a = self.app; P = a.proj
+        return (self.width(), self.height(), round(self.pps, 5), self.xoff, a.sel, id(P), len(P.clips), len(P.tracks),
+                round(sum(c["start"] * 1.7 + c["dur"] * 1.3 + c["inp"] for c in P.clips), 4), len(getattr(a, "multi", ())), len(getattr(a.thumbs, "cache", ())),
+                tuple(sorted(getattr(getattr(a, "renderer", None), "bake", None) and a.renderer.bake.status().items() or ())))
     def paintEvent(self, e):
+        # Patch 38: while the preview plays, everything except the playhead is drawn once and then only copied.
+        a = self.app
+        if a.proj and a.playing and not self.drag and not getattr(self, "_hide_ph", False):
+            try:
+                sig = self._static_sig()
+                if getattr(self, "_pc", None) is None or self._pc_sig != sig:
+                    dpr = self.devicePixelRatioF(); pm = QPixmap(int(self.width() * dpr), int(self.height() * dpr)); pm.setDevicePixelRatio(dpr)
+                    self._hide_ph = True; self._dev = pm
+                    try: self._paint_full(e)
+                    finally: self._hide_ph = False; self._dev = None
+                    self._pc = pm; self._pc_sig = sig
+                p = QPainter(self); p.drawPixmap(0, 0, self._pc); p.setRenderHint(QPainter.Antialiasing); self._draw_playhead(p, self.height()); p.end()
+                return
+            except Exception:
+                self._pc = None; self._hide_ph = False; self._dev = None
+        else: self._pc = None
+        self._paint_full(e)
+    def _paint_full(self, e):
         self._paint_core(e)
         app = self.app
         if not app.proj: return
         self._draw_proxy_bars()
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p = QPainter(self._dev or self); p.setRenderHint(QPainter.Antialiasing)
         p.setClipRect(QRectF(self.HEAD, self.RULER, self.width() - self.HEAD, self.height() - self.RULER))
         lane = {tr["id"]: (ty, h) for tr, ty, h in self.lanes()}; multi = getattr(app, "multi", set())
         for c in app.proj.clips:

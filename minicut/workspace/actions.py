@@ -378,6 +378,7 @@ class WorkspaceMixin:
             nt["name"] = st["name"]; tmap[st["id"]] = nt["id"]
         a, b = c["start"], c["start"] + c["dur"]; off = c["start"] - c["inp"]
         for ch in c.get("children", []):
+            ch = compound_view(c, ch)          # Patch 53: with a speed on the compound the clips come out already faster / slower
             s = ch["start"] + off; e = s + ch["dur"]; s2, e2 = max(s, a), min(e, b)
             if e2 <= s2: continue
             n = copy.deepcopy(ch); n["id"] = new_id(); n["track"] = tmap.get(ch["track"], c["track"])

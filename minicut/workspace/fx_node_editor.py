@@ -142,8 +142,8 @@ class FxNode(QGraphicsItem):
 
     def _pick_color(self, btn, key):
         cur = (self.d.get("p") or {}).get(key) or "#ffffff"
-        c = QColorDialog.getColor(QColor(cur), btn.window(), "Colour")
-        if c.isValid(): self._paint_swatch(btn, c.name()); self.sc.edit_param(self.nid, key, c.name())
+        # the program's own colour window (with the eye-dropper), next to the mouse
+        open_color_popup(btn, cur, lambda c: self._paint_swatch(btn, c), lambda c: (self._paint_swatch(btn, c), self.sc.edit_param(self.nid, key, c)), at_cursor=True)
 
     def _build(self):
         typ = self.d["type"]; p = self.d.get("p") or {}; ex = self.d.get("ex") or {}
@@ -510,8 +510,8 @@ class FxSliders(QScrollArea):
         self.lay.addStretch()
 
     def _pick(self, btn, key):
-        c = QColorDialog.getColor(QColor(self.win.engine.values.get(key, "#ffffff")), self, "Colour")
-        if c.isValid(): FxNode._paint_swatch(btn, c.name()); self.win.slider_changed(key, c.name())
+        open_color_popup(btn, self.win.engine.values.get(key, "#ffffff"), lambda c: FxNode._paint_swatch(btn, c),
+                         lambda c: (FxNode._paint_swatch(btn, c), self.win.slider_changed(key, c)), at_cursor=True)
 
     def set_values(self, values):
         for key, w in self._w.items():

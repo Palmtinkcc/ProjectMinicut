@@ -4,6 +4,12 @@ from ..shared.icons import *
 from .renderer import *
 
 
+def _set_playing(v):
+    try:
+        from . import media as _m; _m.PLAYING[0] = bool(v)
+    except Exception: pass
+
+
 def _follow_playhead(app):
     tl = getattr(app, "timeline", None)
     if not tl or tl.drag or not app.playing: return
@@ -36,9 +42,9 @@ class PlaybackMixin:
         if getattr(self,'_rec',None): return                           # recording: the playhead follows the microphone
         if self._mprev is not None: self.media_toggle_play(); return    # media preview: Space plays the media
         if self.playing:self.stop_play()
-        else:self.playing=True; self._last_tick=time.monotonic(); self.timer.start(); self.audio.start(self.proj,self.t,min(90,max(0.1,self.proj.duration()-self.t)))
+        else:self.playing=True; _set_playing(True); self._last_tick=time.monotonic(); self.timer.start(); self.audio.start(self.proj,self.t,min(90,max(0.1,self.proj.duration()-self.t)))
         if hasattr(self,'preview'):set_play_icon(self.preview.play_btn, self.playing)
-    def stop_play(self):self.playing=False; self.timer.stop(); self.audio.stop()
+    def stop_play(self):self.playing=False; _set_playing(False); self.timer.stop(); self.audio.stop()
     def tick(self):
         if not self.proj: return
         now = time.monotonic(); tl = getattr(self, "timeline", None)
@@ -116,6 +122,5 @@ class PlaybackMixin:
             QApplication.instance().aboutToQuit.connect(w.stop); self._rworker = w
         self.renderer.live_play = bool(self.playing or fast_now)       # Patch 40: effects may use fewer pixels while it moves
         w.submit(self.proj, self.t, q, fast_now or self.settings["preview_interp"] == "fast")
-    def toggle_play_shortcut(self):self.toggle_play()
     def _on_frame(self, img):
         if hasattr(self, "viewport"): self.viewport.set_frame(img)

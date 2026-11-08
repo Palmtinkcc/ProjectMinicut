@@ -9,7 +9,6 @@ def polar(h, w, p):
     """px, py (picture pixels relative to the center), r, angle, and the center."""
     x, y = coords(h, w); cx, cy = w * p.get("cx", 50) / 100.0, h * p.get("cy", 50) / 100.0; dx, dy = x - cx, y - cy; return dx, dy, np.sqrt(dx * dx + dy * dy), np.arctan2(dy, dx), cx, cy
 def sample_polar(img, cx, cy, rs, ang, border=cv2.BORDER_REFLECT): return remap(img, cx + rs * np.cos(ang), cy + rs * np.sin(ang), border)
-def clipA(img, mask): out = img.copy(); out[..., 3] = (img[..., 3] * mask).astype(np.uint8); return out
 
 
 # ------------------------------------------------------------------ distortion & warp
@@ -239,8 +238,11 @@ reg("liquidwave", WG, "Liquid wave", [F("amount", "Amount", 10, 0, 100), F("leng
 
 
 def fx_melting(img, p, ctx):
-    h, w = img.shape[:2]; pr = prog(p, ctx); x, y = coords(h, w); s = S(ctx, p["width"]); col = np.random.default_rng(int(p["seed"])).random(int(w / s) + 3).astype(np.float32); col = cv2.resize(col[None, :], (w, 1), interpolation=cv2.INTER_CUBIC)[0]
-    drip = (0.3 + col * 0.7)[None, :] * pr * h * 1.3 * (1 + 0.3 * np.sin(x / (s * 3))); ysrc = y - drip * (0.4 + 0.6 * (y / h)); return remap_clear(img, x, ysrc)       # what melts away leaves empty space at the top; nothing is mirrored back
+    h, w = img.shape[:2]; rh, rw = ref_size(h, w); ox, oy = ref_origin()      # the media: the whole picture, unless the effect spills outside the media
+    pr = prog(p, ctx); x, y = coords(h, w); s = S(ctx, p["width"]); xr, yr = x - ox, y - oy
+    col = np.random.default_rng(int(p["seed"])).random(int(rw / s) + 3).astype(np.float32); col = cv2.resize(col[None, :], (rw, 1), interpolation=cv2.INTER_CUBIC)[0]
+    col = col[np.clip(xr[0].astype(np.int32), 0, rw - 1)]
+    drip = (0.3 + col * 0.7)[None, :] * pr * rh * 1.3 * (1 + 0.3 * np.sin(xr / (s * 3))); ysrc = y - drip * (0.4 + 0.6 * np.clip(yr / rh, 0, None)); return remap_clear(img, x, ysrc)       # what melts away leaves empty space at the top; nothing is mirrored back
 reg("melting", WG, "Melting screen", WIPE(50) + [F("width", "Drip width", 30, 4, 200), SEED()], fx_melting, "The picture melts and drips down the screen.", "drip slime")
 
 
@@ -337,4 +339,4 @@ def fx_moveblur(img, p, ctx):
     h, w = img.shape[:2]; k = 0.5 - 0.5 * np.cos(2 * np.pi * ctx.lt / max(0.2, p["period"])); L = p["length"] * k * ctx.k; a = np.deg2rad(p["angle"] + ctx.lt * p["turn"]); n = 14 if ctx.fast else 20
     if L < 0.5: return img
     return _avg(img, [np.float32([[1, 0, np.cos(a) * L * (i / (n - 1) - 0.5)], [0, 1, np.sin(a) * L * (i / (n - 1) - 0.5)]]) for i in range(n)], w, h)
-reg("moveblur", BL, "Motion blur (move blur)", [F("length", "Most blur", 60, 0, 300), F("angle", "Direction", 0, -180, 180), F("period", "Blur comes and goes every (s)", 1.5, 0.3, 20), F("turn", "Direction turns (deg / s)", 0, -360, 360)], fx_moveblur, "A motion blur that swells and fades by itself, like a camera whip.", "whip pan camera move")
+reg("moveblur", BL, "Pulsing directional blur (old move blur)", [F("length", "Most blur", 60, 0, 300), F("angle", "Direction", 0, -180, 180), F("period", "Blur comes and goes every (s)", 1.5, 0.3, 20), F("turn", "Direction turns (deg / s)", 0, -360, 360)], fx_moveblur, "A motion blur that swells and fades by itself, like a camera whip.", "whip pan camera move")

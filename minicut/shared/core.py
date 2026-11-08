@@ -218,7 +218,7 @@ def set_prop(c, name, lt, v):
 # A clip's "speed" property is in percent (100 = normal) and can have keyframes. The clip's length on the timeline is the
 # time you see; the file is read faster / slower. src_time() says which moment of the FILE is on screen at a moment of the clip.
 SPEED_MIN, SPEED_MAX = 5.0, 1000.0
-SPEED_KINDS = ("video", "audio", "gif")
+SPEED_KINDS = ("video", "audio", "gif", "compound")      # Patch 53: a compound clip has a speed too (what is inside runs faster / slower)
 _SPEED_TABLES = OrderedDict()
 _SPEED_STEP = 1.0 / 120
 
@@ -344,7 +344,8 @@ def make_clip(kind, path, track, start, dur, src_dur=0.0, name=""):
             "props": {k: {"v": v, "k": []} for k, v in DEFAULT_PROPS.items()},
             "blend": "normal", "effects": [],      # effects: ordered effect layers, see render/effects.py
             "text": "Your text", "font": "Segoe UI", "fsize": 96, "tcolor": "#ffffff", "bold": True,
-            "stroke": 0, "scolor": "#000000", "mask": "None", "mask_feather": 0}
+            "stroke": 0, "scolor": "#000000", "mask": "None", "mask_feather": 0,
+            "origin": [0.0, 0.0]}      # origin: the pivot of the media (turn / scale happen around it) as % of the media size from its centre; [0, 0] = the centre
 
 
 def migrate_clip(c):
@@ -435,6 +436,29 @@ def _bake_ancestor_volume(n, ancestors):
     n["props"]["volume"]["v"] = n["props"]["volume"]["k"][0]["v"] if n["props"]["volume"]["k"] else n["props"]["volume"]["v"]
 
 
+def compound_rate(comp):
+    """Patch 53: how fast the inside of a compound clip runs (1.0 = normal). With a keyframed speed: the average over the clip."""
+    if not clip_has_speed(comp) or comp.get("dur", 0) <= 1e-9: return 1.0
+    return max(1e-3, (src_time(comp, comp["dur"]) - comp["inp"]) / comp["dur"])
+
+
+def compound_view(comp, ch):
+    """Patch 53: a clip inside a compound clip as it must sit on the inner timeline when the compound has a speed of s: s times faster
+    means it starts and ends 1/s as late, its keyframes are 1/s as far apart and its own speed is multiplied by s (so its sound follows)."""
+    s = compound_rate(comp)
+    if abs(s - 1.0) < 1e-9: return ch
+    n = copy.deepcopy(ch); i0 = comp["inp"]
+    n["start"] = i0 + (ch["start"] - i0) / s; n["dur"] = ch["dur"] / s
+    for pr in n["props"].values():
+        for k in pr["k"]: k["t"] = k["t"] / s
+    sp = n["props"].get("speed")
+    if sp is not None and n.get("kind") in SPEED_KINDS:
+        sp["v"] = sp["v"] * s
+        for k in sp["k"]: k["v"] = k["v"] * s
+    if comp.get("pitch_follow"): n["pitch_follow"] = True
+    return n
+
+
 def flatten_compounds(proj):
     """Replace every compound clip (at any nesting depth) with its children, placed at their place on the main
     timeline. Each child's volume is multiplied by the volume (constant or animated) of every compound clip it sits
@@ -453,7 +477,9 @@ def flatten_compounds(proj):
                 nlo, nhi = max(lo, a), min(hi, b)
                 if nhi <= nlo: continue
                 p.tracks += c.get("subtracks", [])
-                walk(c.get("children", []), off + c["start"] - c["inp"], ancestors + [(c, a)], nlo, nhi)
+                kids = c.get("children", [])
+                if abs(compound_rate(c) - 1.0) > 1e-9: kids = [compound_view(c, k) for k in kids]        # Patch 53: speed of the compound
+                walk(kids, off + c["start"] - c["inp"], ancestors + [(c, a)], nlo, nhi)
             else:
                 if c["kind"] not in ("audio", "video"): continue
                 s, e = c["start"] + off, c["start"] + off + c["dur"]; s2, e2 = max(s, lo), min(e, hi)

@@ -240,7 +240,6 @@ class FxDoc:
 
     # -- lookups --
     def node(self, nid): return next((n for n in self.graph["nodes"] if n["id"] == nid), None)
-    def links_of(self, nid): return [l for l in self.graph["links"] if l["from"] == nid or l["to"] == nid]
     def link_into(self, b, ti): return next((l for l in self.graph["links"] if l["to"] == b and l["ti"] == ti), None)
 
     # -- editing --

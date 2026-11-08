@@ -151,6 +151,85 @@ class _HueBar(QWidget):
     def mouseReleaseEvent(self, e): self.pop.commit()
 
 
+class _ScreenShot(QWidget):
+    """One full-screen layer showing a still picture of one screen, with a magnifier at the mouse. Part of ScreenDropper."""
+    live = Signal(str); picked = Signal(str); cancelled = Signal()
+    GRID = 11; CELL = 12                      # the magnifier shows GRID x GRID screen pixels, every one CELL pixels wide
+    def __init__(self, screen, pm):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_DeleteOnClose); self.setMouseTracking(True); self.setCursor(Qt.CrossCursor); self.setFocusPolicy(Qt.StrongFocus)
+        self.pm = pm; self.img = pm.toImage(); self.pt = None; self.setGeometry(screen.geometry())
+    def _px(self, pos):
+        """The screen pixel (in the picture's own pixels) under a position of this widget."""
+        sx = self.img.width() / max(1.0, float(self.width())); sy = self.img.height() / max(1.0, float(self.height()))
+        return min(self.img.width() - 1, max(0, int(pos.x() * sx))), min(self.img.height() - 1, max(0, int(pos.y() * sy)))
+    def _hex(self, pos):
+        x, y = self._px(pos); return self.img.pixelColor(x, y).name()
+    def paintEvent(self, e):
+        p = QPainter(self); p.drawPixmap(self.rect(), self.pm)
+        if self.pt is None: return
+        x, y = self._px(self.pt); half = self.GRID // 2; size = self.GRID * self.CELL
+        ox = self.pt.x() + 22; oy = self.pt.y() + 22                      # the magnifier lies right / below the mouse, and flips at the screen edges
+        if ox + size > self.width(): ox = self.pt.x() - 22 - size
+        if oy + size + 24 > self.height(): oy = self.pt.y() - 22 - size - 24
+        r = QRectF(ox, oy, size, size); clip = QPainterPath(); clip.addEllipse(r)
+        p.save(); p.setClipPath(clip); p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.fillRect(r, QColor(0, 0, 0)); p.drawImage(r, self.img, QRectF(x - half, y - half, self.GRID, self.GRID)); p.restore()
+        p.setRenderHint(QPainter.Antialiasing); p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor(0, 0, 0, 200), 3)); p.drawEllipse(r)
+        p.setPen(QPen(QColor(255, 255, 255), 1.5)); p.drawEllipse(r)
+        c = QRectF(ox + half * self.CELL, oy + half * self.CELL, self.CELL, self.CELL)                 # the pixel that will be taken
+        p.setPen(QPen(QColor(0, 0, 0), 2)); p.drawRect(c); p.setPen(QPen(QColor(255, 255, 255), 1)); p.drawRect(c)
+        hx = self.img.pixelColor(x, y).name(); lab = QRectF(ox + size / 2 - 38, oy + size + 4, 76, 18)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200)); p.drawRoundedRect(lab, 5, 5)
+        f = QFont(self.font()); f.setPixelSize(12); f.setBold(True); p.setFont(f); p.setPen(QColor(255, 255, 255)); p.drawText(lab, Qt.AlignCenter, hx)
+    def mouseMoveEvent(self, e):
+        self.pt = e.position(); self.update(); self.live.emit(self._hex(self.pt))
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton: self.picked.emit(self._hex(e.position()))
+        else: self.cancelled.emit()
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape: self.cancelled.emit()
+
+
+class ScreenDropper(QObject):
+    """Pick a colour from anywhere on the screen (any program, any monitor): a still picture of every screen is laid over it, with a
+    magnifier at the mouse. Click = take the colour under the mouse, Esc / right click = cancel. Needs the system to allow screen capture."""
+    live = Signal(str); picked = Signal(str); cancelled = Signal()
+    def __init__(self):
+        super().__init__(); self.layers = []; self._done = False
+    def start(self):
+        """False when no screen could be captured (then nothing is shown)."""
+        for scr in QApplication.screens():
+            try: pm = scr.grabWindow(0)
+            except Exception: continue
+            if pm.isNull(): continue
+            w = _ScreenShot(scr, pm); w.live.connect(self.live); w.picked.connect(lambda c: self._end(c)); w.cancelled.connect(lambda: self._end(None)); self.layers.append(w)
+        if not self.layers: return False
+        for w in self.layers: w.show(); w.raise_()
+        first = next((w for w in self.layers if w.geometry().contains(QCursor.pos())), self.layers[0]); first.activateWindow(); first.setFocus()
+        return True
+    def _end(self, color):
+        if self._done: return
+        self._done = True
+        for w in self.layers: w.close()
+        self.layers = []
+        if color: self.picked.emit(color)
+        else: self.cancelled.emit()
+
+
+class _PipetteBtn(QPushButton):
+    """A small eye-dropper button (drawn here, no icon file needed)."""
+    def __init__(self):
+        super().__init__(); self.setFixedSize(30, 26); self.setCursor(Qt.PointingHandCursor); self.setFocusPolicy(Qt.NoFocus); self.setToolTip("Pick a colour from the screen")
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+        p.setPen(QPen(QColor("#22d3ee" if self.underMouse() else "#3a3a40"), 1)); p.setBrush(QColor("#2a2a30" if self.underMouse() else "#18181b")); p.drawRoundedRect(r, 5, 5)
+        p.setPen(QPen(QColor("#e6e6e6"), 1.8, Qt.SolidLine, Qt.RoundCap)); c = r.center()
+        p.drawLine(QPointF(c.x() - 5, c.y() + 5), QPointF(c.x() + 2, c.y() - 2))                        # the tube
+        p.setPen(QPen(QColor("#e6e6e6"), 3.2, Qt.SolidLine, Qt.RoundCap)); p.drawLine(QPointF(c.x() + 1, c.y() - 3), QPointF(c.x() + 5, c.y() + 1))    # the bulb
+        p.setPen(QPen(QColor("#e6e6e6"), 1.8, Qt.SolidLine, Qt.RoundCap)); p.drawLine(QPointF(c.x() - 5, c.y() + 5), QPointF(c.x() - 6, c.y() + 6))   # the tip
+
+
 class ColorPopup(QFrame):
     live = Signal(str); picked = Signal(str)
     def __init__(self, color, parent):
@@ -162,7 +241,8 @@ class ColorPopup(QFrame):
         row = QHBoxLayout(); row.setSpacing(8)
         self.sw = QLabel(); self.sw.setFixedSize(26, 26)
         self.hex = QLineEdit(); self.hex.setMaxLength(7); self.hex.editingFinished.connect(self._hex)
-        row.addWidget(self.sw); row.addWidget(self.hex, 1); v.addLayout(row)
+        self.pip = _PipetteBtn(); self.pip.clicked.connect(self._drop_start); self._dropper = None; self._before = None
+        row.addWidget(self.sw); row.addWidget(self.hex, 1); row.addWidget(self.pip); v.addLayout(row)
         grid = QGridLayout(); grid.setSpacing(6)
         for i, col in enumerate(COLOR_PRESETS):
             b = QToolButton(); b.setFixedSize(22, 22); b.setCursor(Qt.PointingHandCursor)
@@ -185,6 +265,30 @@ class ColorPopup(QFrame):
     def _hex(self):
         t = self.hex.text().strip(); self.set_hex(t if t.startswith("#") else "#" + t, True)
     def commit(self): self.picked.emit(self.color())
+    # ---- the eye-dropper: the popup steps aside while the whole screen is shown, then comes back with the colour ----
+    def _drop_start(self):
+        self._before = self.color(); self.hide(); QTimer.singleShot(90, self._drop_go)           # a moment for the popup to disappear before the screen is captured
+    def _drop_go(self):
+        d = ScreenDropper(); self._dropper = d
+        d.live.connect(self.live); d.picked.connect(self._drop_picked); d.cancelled.connect(self._drop_cancel)
+        if not d.start(): self._drop_cancel()
+    def _drop_picked(self, c):
+        self._dropper = None; self.set_hex(c, True); self.show()
+    def _drop_cancel(self):
+        self._dropper = None
+        if self._before: self.live.emit(self._before)
+        self.show()
+
+
+def open_color_popup(anchor, color, on_live, on_picked, at_cursor=False):
+    """The program's colour window under `anchor` (or at the mouse). Everything that picks a colour goes through this one window."""
+    pop = ColorPopup(color, anchor.window())
+    pop.live.connect(on_live); pop.picked.connect(on_picked); pop.adjustSize()
+    if at_cursor: g = QCursor.pos() + QPoint(8, 8); scr = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).availableGeometry(); top = g.y() - 16
+    else: g = anchor.mapToGlobal(QPoint(0, anchor.height() + 4)); scr = anchor.screen().availableGeometry(); top = anchor.mapToGlobal(QPoint(0, 0)).y()
+    x = max(scr.left() + 4, min(g.x(), scr.right() - pop.width() - 4))
+    y = g.y() if g.y() + pop.height() < scr.bottom() else max(scr.top() + 4, top - pop.height() - 4)
+    pop.move(x, y); pop.show(); return pop
 
 
 class ColorButton(QPushButton):
@@ -198,13 +302,7 @@ class ColorButton(QPushButton):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         p.setPen(QPen(QColor("#ffffff" if self.underMouse() else "#4a4a52"), 1)); p.setBrush(QColor(self.c))
         p.drawRoundedRect(r, 5, 5)
-    def pick(self):
-        pop = ColorPopup(self.c, self.window())
-        pop.live.connect(self._live); pop.picked.connect(self._picked); pop.adjustSize()
-        g = self.mapToGlobal(QPoint(0, self.height() + 4)); scr = self.screen().availableGeometry()
-        x = min(g.x(), scr.right() - pop.width() - 4)
-        y = g.y() if g.y() + pop.height() < scr.bottom() else self.mapToGlobal(QPoint(0, 0)).y() - pop.height() - 4
-        pop.move(x, y); pop.show()
+    def pick(self): open_color_popup(self, self.c, self._live, self._picked)
     def _live(self, c): self.c = c; self.update()
     def _picked(self, c): self.set(c); self.changed.emit(c)
 

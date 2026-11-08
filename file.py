@@ -6,4 +6,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from minicut.app import main
 
 if __name__ == "__main__":
+    if os.environ.get("MINICUT_PROFILE"):
+        from minicut import profiler; profiler.start()
     main()

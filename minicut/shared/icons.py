@@ -308,21 +308,6 @@ def svg_icon(name, color="#dfe3ea", on="#22d3ee", off="#5d6476"):
     return ic
 
 
-def svg_combo_icon(names, color="#dfe3ea"):
-    """Several icons side by side in one QIcon."""
-    key = ("combo", tuple(names), color)
-    if key in _ICON_CACHE: return _ICON_CACHE[key]
-    ic = QIcon()
-    for s in (16, 20, 24, 32, 48):
-        step = int(s * 0.8); w = step * (len(names) - 1) + s
-        for mode, col in ((QIcon.Normal, color), (QIcon.Disabled, "#5d6476")):
-            pm = QPixmap(w, s); pm.fill(Qt.transparent); p = QPainter(pm)
-            for i, n in enumerate(names): p.drawPixmap(i * step, 0, svg_pixmap(n, col, s))
-            p.end(); ic.addPixmap(pm, mode, QIcon.Off)
-    _ICON_CACHE[key] = ic
-    return ic
-
-
 def app_icon(name, color=None):
     """Icon used everywhere in the app (an optional colour overrides the default light grey)."""
     return svg_icon(name, color) if color else svg_icon(name)

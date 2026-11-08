@@ -66,9 +66,6 @@ class AudioFxPanel(QWidget):
             r.addWidget(sl, 1); r.addWidget(nf); v.addLayout(r)
         return box
 
-    def _chain(self):
-        c = self.app.sel_clip()
-        return None if c is None else c.setdefault("afx", [])
 
     def add_effect(self, k):
         c = self.app.sel_clip()

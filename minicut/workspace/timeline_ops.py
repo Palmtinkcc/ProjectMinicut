@@ -72,35 +72,6 @@ def trim_r_bounds(c, nxt, fps, roll=True):
     return lo, hi
 
 
-def apply_trim_l(c, ns, fps, prev=None, roll=True):
-    """Move c's left edge to ns (already clamped by trim_l_bounds). If a clip touches c's old left edge and roll is
-    on, its right edge (and duration) changes by the same amount, so the two clips stay joined with no gap or
-    overlap. Returns the delta applied to c's start (0 if nothing moved)."""
-    old_start = c["start"]; ns = max(ns, old_start - c["dur"] + 1 / fps)
-    delta = ns - old_start
-    if abs(delta) < 1e-9: return 0.0
-    c["start"] = ns; c["dur"] = old_start + c["dur"] - ns
-    if _has_source(c): c["inp"] = max(0.0, c["inp"] + src_delta(c, delta))
-    _shift_keys(c, -delta)
-    if roll and prev is not None and touches(prev["start"] + prev["dur"], old_start, fps):
-        prev["dur"] = prev["dur"] + delta
-    return delta
-
-
-def apply_trim_r(c, ne, fps, nxt=None, roll=True):
-    """Move c's right edge to ne (already clamped by trim_r_bounds). A touching next clip is rolled the same way."""
-    old_end = c["start"] + c["dur"]; ne = max(ne, c["start"] + 1 / fps)
-    delta = ne - old_end
-    if abs(delta) < 1e-9: return 0.0
-    c["dur"] = ne - c["start"]
-    if roll and nxt is not None and touches(old_end, nxt["start"], fps):
-        nxt["start"] = nxt["start"] + delta
-        if _has_source(nxt): nxt["inp"] = max(0.0, nxt["inp"] + src_delta(nxt, delta))
-        nxt["dur"] = nxt["dur"] - delta
-        _shift_keys(nxt, -delta)
-    return delta
-
-
 def group_ids_of(clips, clip):
     g = clip.get("group")
     return {o["id"] for o in clips if g and o.get("group") == g} | {clip["id"]}

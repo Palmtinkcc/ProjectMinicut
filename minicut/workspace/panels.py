@@ -11,6 +11,7 @@ from .afx_panel import AudioFxPanel
 from .curve_panel import PresetTile, all_presets
 from .viewport import *
 from .effects_panel import EffectsPanel
+from .viewport_points import set_origin_now
 
 
 class MaskCanvas(QWidget):
@@ -287,33 +288,6 @@ class MaskPanel(QWidget):
         except Exception as ex: print("mask bg:", ex)
 
 
-def placeholder_icon(kind, w=112, h=64):
-    pm = QPixmap(w, h); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
-    p.setPen(Qt.NoPen); p.setBrush(QColor("#16213a")); p.drawRoundedRect(0, 0, w, h, 8, 8)
-    if kind == "audio":
-        p.setPen(QPen(QColor("#5aa2ff"), 2.2, Qt.SolidLine, Qt.RoundCap))
-        heights = [8, 14, 6, 22, 30, 15, 24, 11, 32, 18, 9, 25, 13, 29, 17, 7, 21, 12]
-        cx = w / 2 - len(heights) * 3 / 2
-        for i, hh in enumerate(heights): p.drawLine(QPointF(cx + i * 3, h / 2 - hh / 2), QPointF(cx + i * 3, h / 2 + hh / 2))
-    else:
-        nm = {"video": "video", "image": "image", "gif": "gif"}.get(kind)
-        if nm:
-            s = int(min(w, h) * 0.5); p.drawPixmap((w - s) // 2, (h - s) // 2, svg_pixmap(nm, "#5aa2ff", s))
-        else:
-            p.setPen(QColor("#5aa2ff")); f = p.font(); f.setPointSize(15); f.setBold(True); p.setFont(f)
-            p.drawText(QRect(0, 0, w, h), Qt.AlignCenter, "?")
-    p.end()
-    return QIcon(pm)
-
-
-def icon_from_image(img, w=112, h=64):
-    pm = QPixmap(w, h); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
-    path = QPainterPath(); path.addRoundedRect(0, 0, w, h, 8, 8); p.setClipPath(path); p.fillRect(0, 0, w, h, QColor("#05080f"))
-    s = min(w / img.width(), h / img.height()); iw, ih = img.width() * s, img.height() * s
-    p.setRenderHint(QPainter.SmoothPixmapTransform); p.drawImage(QRectF((w - iw) / 2, (h - ih) / 2, iw, ih), img); p.end()
-    return QIcon(pm)
-
-
 def scan_folder(folder, depth=2, limit=600):
     out = []
     def rec(d, lv):
@@ -536,7 +510,6 @@ class MediaPanel(Panel):
                 if it.data(Qt.UserRole) == keep: it.setSelected(True); self.list.setCurrentItem(it); found = True; break
         self.list.blockSignals(False)
         if keep is not None and not found: self.app.exit_media_preview()
-    def refresh_icons(self): self.list.viewport().update()
 
 
 class PreviewPanel(Panel):
@@ -628,6 +601,14 @@ class Inspector(Panel):
         f.addWidget(sec)
         sec = Section("Rotation", "rotate"); row = RotRow(self); self.rows["rot"] = row; sec.body.addWidget(row)
         fl = QHBoxLayout(); fl.setSpacing(6); fl.addWidget(Btn("Flip H", "flip", "soft", "Mirror left / right", lambda: self.quick("fh"), h=28)); fl.addWidget(Btn("Flip V", "swap_vert", "soft", "Mirror up / down", lambda: self.quick("fv"), h=28)); sec.body.addLayout(fl); f.addWidget(sec)
+        self.org_show = Toggle("Show", bool(getattr(app, "origin_edit", False)), "Show the origin as a dot on the preview and drag it there (Alt = no snapping). The media turns and scales around this point.")
+        self.org_show.toggled.connect(self._on_origin_show); sec = Section("Origin", "center", self.org_show)
+        orow = QHBoxLayout(); orow.setSpacing(10); self._org_before = None
+        self.org_x = NumberField(0.0, -500.0, 500.0, 1, "%", "X", 0.2); self.org_y = NumberField(0.0, -500.0, 500.0, 1, "%", "Y", 0.2)
+        for nf in (self.org_x, self.org_y):
+            nf.changed.connect(self._on_origin_edit); nf.finished.connect(self._on_origin_done); orow.addWidget(nf, 1)
+        sec.body.addLayout(orow)
+        sec.body.addWidget(Btn("Reset origin", "reset", "soft", "Put the origin back in the middle of the media (the picture stays where it is)", self._reset_origin, h=28)); f.addWidget(sec)
         sec = Section("Look", "opacity"); row = PropRow(self, "opacity", "Opacity", 0, 100, 0, 100, 0, "%", "slider", "Opacity"); row.layout().itemAt(0).widget().setFixedWidth(52); self.rows["opacity"] = row; sec.body.addWidget(row)
         self.blend = Dropdown([(b.title(), b) for b in BLENDS]); self.blend.changed.connect(self.on_blend)
         br = QHBoxLayout(); l = label_w("Blend"); l.setFixedWidth(52); br.addWidget(l); br.addWidget(self.blend, 1); sec.body.addLayout(br); f.addWidget(sec)
@@ -635,7 +616,8 @@ class Inspector(Panel):
         # ---- Effects: effect layers (colour, blur, colour split, area blur, key ...) ----
         sa, f = page()
         self.area_panel = MaskPanel(app, holder_fn=lambda c: self.fx_panel.area_holder(c))
-        self.fx_panel = EffectsPanel(app, self.area_panel); f.addWidget(self.fx_panel); f.addStretch(); self.tabs.addTab(sa, "Effects", "effects", "Effects with a live preview")
+        self.fx_panel = EffectsPanel(app, self.area_panel); f.addWidget(self.fx_panel); f.addStretch(); self.fx_tab = self.tabs.addTab(sa, "Effects", "effects", "Effects with a live preview")
+        self.tabs.currentChanged.connect(lambda *_: self._repaint_viewport())          # the effect centre points show only while this tab is open
         # ---- Text ----
         sa, f = page(); sec = Section("Text", "text"); self.txt = TextBox(96); self.txt.textChanged.connect(lambda: self.on_text("text", self.txt.toPlainText())); sec.body.addWidget(self.txt); f.addWidget(sec)
         sec = Section("Style", "adjust")
@@ -691,6 +673,9 @@ class Inspector(Panel):
         for i, ok in enumerate((vis, vis, k == "text", k in ("video", "audio", "compound"), k in SPEED_KINDS, True)): self.tabs.setTabVisible(i, ok)
         lt = self.app.t - c["start"]
         for n, row in self.rows.items(): row.set(prop_at(c, n, lt), key_at(c, n, lt) is not None, bool(c["props"][n]["k"]))
+        ox, oy = (lambda o: (o[0], o[1]) if isinstance(o, (list, tuple)) and len(o) >= 2 else (0.0, 0.0))(c.get("origin"))
+        for nf, val in ((self.org_x, ox), (self.org_y, oy)):
+            if nf._press is None and not nf.ed.isVisible(): nf.setValue(val)
         self.blend.setCurrentIndex(BLENDS.index(c["blend"]) if c["blend"] in BLENDS else 0)
         self.afx_panel.setVisible(k != "compound"); self.sound.load(c)
         self.fx_panel.load(c, force=full)
@@ -833,19 +818,6 @@ class Inspector(Panel):
         self.app.checkpoint()
         for kf in c["props"][self.kprop.currentData()]["k"]: kf["e"] = list(self.ease.e)
         self.app.on_changed(insp=False)
-    def apply_transform_all(self):
-        c = self.app.sel_clip()
-        if not c: return
-        curve = self._curve_to_copy()
-        names = ("x", "y", "sx", "sy", "rot", "opacity")
-        targets = [(name, kf) for name in names for kf in c["props"].get(name, {}).get("k", [])[:-1]]
-        if not targets:
-            if hasattr(self.app, "toast"): self.app.toast.show_msg("Add at least 2 keyframes to a Transform property first")
-            return
-        self.app.checkpoint()
-        for _, kf in targets: kf["e"] = list(curve)
-        self.app.on_changed(insp=False); self.refresh()
-        if hasattr(self.app, "toast"): self.app.toast.show_msg(f"Curve applied to {len(targets)} Transform segments")
     def on_blend(self, i):
         c = self._c()
         if c: self.app.checkpoint(); c["blend"] = BLENDS[i]; self.app.on_changed(insp=False)
@@ -869,6 +841,25 @@ class Inspector(Panel):
         elif what == "reset":
             for k in ("x", "y", "sx", "sy", "rot", "opacity"): c["props"][k] = {"v": DEFAULT_PROPS[k], "k": []}
         self.app.on_changed(insp=False); self.refresh()
+    # ---- origin of the media ----
+    def _repaint_viewport(self):
+        vp = getattr(self.app, "viewport", None)
+        if vp is not None: vp.update()
+    def _on_origin_show(self, on):
+        self.app.origin_edit = bool(on); self._repaint_viewport()
+    def _on_origin_edit(self, _v=None):
+        c = self.app.sel_clip()
+        if not c or self.loading: return
+        if self._org_before is None: self._org_before = self.app.begin()
+        set_origin_now(self.app, c, self.org_x.value(), self.org_y.value())
+        self.app.request_render(); self._repaint_viewport()
+    def _on_origin_done(self):
+        if self._org_before is not None: self.app.commit(self._org_before); self._org_before = None
+        self.app.on_changed()
+    def _reset_origin(self):
+        c = self.app.sel_clip()
+        if not c: return
+        self.app.checkpoint(); set_origin_now(self.app, c, 0.0, 0.0); self.app.on_changed()
     def __init__(self, app):
         self._init_core(app)
         self.mask_panel = MaskPanel(app)
@@ -876,6 +867,6 @@ class Inspector(Panel):
         self._mask_tab = self.tabs.addTab(sc, "Mask", "mask", "Mask: show only a part")
     def refresh(self, full=False):
         self._refresh_core(full)
-        c = self.app.sel_clip()
+        c = self.app.sel_clip(); self._repaint_viewport()
         self.tabs.setTabVisible(self._mask_tab, bool(c) and c["kind"] != "audio")
         self.mask_panel.load(c, force=full)

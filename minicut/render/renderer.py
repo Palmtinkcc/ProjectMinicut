@@ -2,7 +2,7 @@
 from ..shared.deps import *
 from ..shared.core import *
 from .nodegraph import *
-from .effects import apply_effects, spill_margin
+from .effects import apply_effects, clip_spills, time_used
 from .fastcomp import blend_into, blend_mode, visible_rect, resize_part, covers_canvas, to_cv_matrix
 from .gpu import GPU
 from .perf import lower_thread_priority
@@ -180,14 +180,47 @@ def _blend(mode, b, t):
 _TLS = threading.local()      # .preview = True on the preview thread (only that thread may use the GPU); .depth = render() nesting
 
 
+def clip_origin(c):
+    """(ox, oy): the pivot of the media in percent of the media size, measured from the centre of the media ([0, 0] = centre)."""
+    o = c.get("origin")
+    try: return float(o[0]), float(o[1])
+    except Exception: return 0.0, 0.0
+
+
+def origin_vec(ox, oy, bw, bh, sx, sy, rot):
+    """(dx, dy) in project pixels from the centre of the media to a point of it that is (ox, oy) percent of the media size away from the
+    centre, with the scale (sx, sy in %) and the rotation (degrees) of the clip applied."""
+    lx, ly = ox / 100.0 * bw * sx / 100.0, oy / 100.0 * bh * sy / 100.0; th = math.radians(rot); cs, sn = math.cos(th), math.sin(th)
+    return lx * cs - ly * sn, lx * sn + ly * cs
+
+
+def origin_shift(c, bw, bh, sx, sy, rot):
+    """(dx, dy) in project pixels from the origin of the media to its centre. Position X / Y put the ORIGIN on the canvas, and the
+    media turns and scales around it, so the centre of the media lies this far from the (x, y) point. (0, 0) when the origin is the centre."""
+    ox, oy = clip_origin(c)
+    if ox == 0.0 and oy == 0.0: return 0.0, 0.0
+    dx, dy = origin_vec(ox, oy, bw, bh, sx, sy, rot); return -dx, -dy
+
+
 class Renderer:
     def __init__(self, pool):
         self.pool = pool; self.lut_cache = {}; self.version = 0   # bumped on every project change (see clear_preview_cache)
         # Rendered frames are kept for repeated scrubbing; the limit is in bytes (Settings -> Preview RAM cache).
         self.preview_cache = OrderedDict(); self.preview_cache_bytes = 300e6; self._pc_bytes = 0
-        self._fx_cache = OrderedDict(); self._fx_bytes = 0; self._fx_lock = threading.Lock()
+        self._fx_cache = OrderedDict(); self._fx_bytes = 0; self._fx_lock = threading.Lock(); self._fx_still = {}      # _fx_still: (clip, effects) -> True when that stack gives the same picture at every moment
         self._src_lock = threading.RLock(); self._cache_lock = threading.RLock(); self._mask_cache = OrderedDict()
-        pool.make_compound = lambda c: CompoundSource(c, self)      # lets the pool build compound-clip sources
+        self._csrc = OrderedDict()
+        def make_compound(c):
+            # Patch 38: one source per compound clip (the pool used to build a NEW one for every call, so its frame cache never worked and a
+            # compound inside a compound was drawn again and again: ~9 composition passes per frame). Only the preview thread reuses them: it
+            # draws from a snapshot that stays the same object until the project changes.
+            if not getattr(_TLS, "preview", False): return CompoundSource(c, self)
+            e = self._csrc.get(id(c))
+            if e is not None and e[0] is c: self._csrc.move_to_end(id(c)); return e[1]
+            src = CompoundSource(c, self); self._csrc[id(c)] = (c, src)
+            while len(self._csrc) > 64: self._csrc.popitem(last=False)
+            return src
+        pool.make_compound = make_compound      # lets the pool build compound-clip sources
     def clear_preview_cache(self):
         self.version += 1   # every edit calls this, so the version tells the preview when the project changed
         with self._cache_lock:
@@ -201,10 +234,46 @@ class Renderer:
             with fx_lock:
                 self._fx_cache.clear()
                 self._fx_bytes = 0
+                self._fx_still.clear()
         # Mask shapes are cached separately; clear them too so edits to mask
         # controls (position, feather, invert, etc.) appear in the preview at once.
         self._mask_cache.clear()
+    def _preroll(self, proj, t):
+        """Patch 54: while the preview plays, the next video clip of every file (it starts within the next 3 s) gets its reader moved to its
+        first frame in the background (see VideoSource.prewarm); a file that is not open yet is opened in the background. Nothing is done when
+        the clip simply goes on where the one before ends (no jump). No work on this thread beyond a short look at the clip list, at most
+        ten times a second."""
+        now = time.monotonic()
+        if now - self.__dict__.get("_pr_t", 0.0) < 0.1: return
+        self._pr_t = now
+        from .media import proxy_sources
+        horizon = float(CFG.get("preroll_s", 3.0)); items = proxy_sources(proj.clips); active = {}; soon = []
+        for c, off in items:
+            if c.get("kind") != "video" or not c.get("path"): continue
+            s = c["start"] + off
+            if s <= t < s + c["dur"]: active.setdefault(c["path"], []).append((c, s))
+            elif t < s <= t + horizon: soon.append((s, c))
+        soon.sort(key=lambda x: x[0]); done = set()
+        for s, c in soon:
+            path = c["path"]
+            if path in done: continue                      # only the nearest clip of each file: one helper reader per file
+            done.add(path); src = self.pool.src.get(path); fps = getattr(src, "fps", 0) or 30; first = src_time(c, 0.0)
+            if any(s <= a_s + a["dur"] + 1e-3 and abs(src_time(a, s - a_s) - first) < 2.0 / fps for a, a_s in active.get(path, ())): continue
+            if src is None:
+                key = ("open", path)
+                if key in self.__dict__.setdefault("_pr_open", set()): continue
+                self._pr_open.add(key)
+                def op(c=c, key=key):
+                    try:
+                        s2 = self.pool.get(c)
+                        if s2 is not None and hasattr(s2, "prewarm"): s2.prewarm(int(src_time(c, 0.0) * (getattr(s2, "fps", 0) or 30) + 1e-6))
+                    finally: self._pr_open.discard(key)
+                threading.Thread(target=op, name="MiniCutPreOpen", daemon=True).start()
+            elif hasattr(src, "prewarm"): src.prewarm(int(first * fps + 1e-6))
     def render_cached(self, proj, t, q, fast=False, ver=None, fp=None):
+        if self.live_play and getattr(_TLS, "preview", False):
+            try: self._preroll(proj, t)
+            except Exception: pass
         fps = max(1, proj.fps); frame = int(round(max(0.0, t) * fps))
         # The frame key is the project content (a fingerprint of everything that is drawn) plus the version.
         if fp is None:
@@ -234,6 +303,7 @@ class Renderer:
         lt = t - c["start"]; x, y, sx, sy, rot = (prop_at(c, k, lt) for k in ("x", "y", "sx", "sy", "rot"))
         hw, hh = bs[0] * sx / 200, bs[1] * sy / 200; th = math.radians(rot); cs, sn = math.cos(th), math.sin(th)
         cx, cy = proj.w / 2 + x, proj.h / 2 + y
+        odx, ody = origin_shift(c, bs[0], bs[1], sx, sy, rot); cx += odx; cy += ody      # the origin sits on (x, y); the centre of the media is offset from it
         return [(cx + lx * cs - ly * sn, cy + lx * sn + ly * cs) for lx, ly in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
 
     # ---------------------------------------------------------------- planning (cheap: no decoding)
@@ -244,9 +314,9 @@ class Renderer:
         if op <= 0.001 or abs(sx) < .01 or abs(sy) < .01: return None
         bs = self.base_size(proj, c)
         if not bs: return None
-        bw, bh = bs
+        bw, bh = bs; rot = prop_at(c, "rot", lt); odx, ody = origin_shift(c, bw, bh, sx, sy, rot)
         return {"c": c, "lt": lt, "op": op, "sx": sx, "sy": sy, "bw": bw, "bh": bh, "ms": max(abs(sx), abs(sy)) / 100,
-                "rot": prop_at(c, "rot", lt), "cx": (proj.w / 2 + prop_at(c, "x", lt)) * q, "cy": (proj.h / 2 + prop_at(c, "y", lt)) * q,
+                "rot": rot, "cx": (proj.w / 2 + prop_at(c, "x", lt) + odx) * q, "cy": (proj.h / 2 + prop_at(c, "y", lt) + ody) * q,
                 "dw": bw * q * abs(sx) / 100, "dh": bh * q * abs(sy) / 100, "W": max(2, int(round(proj.w * q))), "H": max(2, int(round(proj.h * q)))}
     @staticmethod
     def _hides_everything_below(p, W, H):
@@ -285,7 +355,8 @@ class Renderer:
         else:
             src = self.pool.get(c)
             if not src: return None, False
-            if kind == "video" and not has_fx and not gpu: return src.raw_frame(src_time(c, lt)), True
+            alpha_src = getattr(src, "has_alpha", False)          # a Better Chroma Key render: colour + matte, never the opaque shortcuts
+            if kind == "video" and not has_fx and not gpu and not alpha_src: return src.raw_frame(src_time(c, lt)), True
             ds = min(1.0, max(0.125, math.ceil(p["bw"] * q * p["ms"] / src.w * 4) / 4))
             ts = src_time(c, lt) if kind != "image" else 0
             if not has_fx and not gpu:
@@ -294,35 +365,48 @@ class Renderer:
             if has_fx and kind != "compound" and self.live_play and getattr(_TLS, "preview", False) and CFG.get("fx_adapt", True):
                 s = self._fx_scale(c)
                 if s < 0.999: ds = max(0.125, math.floor(ds * s * 8) / 8.0)       # Patch 40: the effect runs on fewer pixels, the placement scales it up
-            img = src.frame(ts, ds)
+            img = src.frame_bgr(ts, ds) if (kind == "video" and has_fx and not alpha_src and not clip_has_mask(c) and not clip_spills(c) and hasattr(src, "frame_bgr")) else src.frame(ts, ds)      # Patch 34: effects work on 3 channels when they can
         if has_fx:
-            m = spill_margin(c)
-            if m:       # an effect may spill outside the media: the picture gets an empty border that the effects can fill
-                ih, iw = img.shape[:2]; mx, my = self._spill_fractions(p, m); px, py = int(round(iw * mx)), int(round(ih * my)); big = np.zeros((ih + 2 * py, iw + 2 * px, 4), np.uint8)
-                if img.ndim == 3 and img.shape[2] == 3: big[py:py + ih, px:px + iw, :3] = img; big[py:py + ih, px:px + iw, 3] = 255
-                else: big[py:py + ih, px:px + iw] = img
-                bw0 = p.setdefault("bw0", p["bw"]); bh0 = p.setdefault("bh0", p["bh"]); p["bw"] = bw0 * big.shape[1] / iw; p["bh"] = bh0 * big.shape[0] / ih
-                return self._effects_cached(c, big, p, fast, (px, py, px + iw, py + ih), bg=bg), False
-            if "bw0" in p: p["bw"], p["bh"] = p["bw0"], p["bh0"]
+            if clip_spills(c):
+                big, inner = self._pad_for_spill(p, img)
+                return self._effects_cached(c, big, p, fast, inner, bg=bg), False
             img = self._effects_cached(c, img, p, fast, bg=bg)
         return img, False
     live_play = False         # True while the preview plays or a slider moves (set by the app); the export renderer never sets it
     @staticmethod
-    def _spill_fractions(p, m):
-        """How far a spilling effect may draw on each side, as a part of the media size: at least `m`, and as far as the edge of the
-        picture frame (it is not visible beyond), within a pixel budget so a small media does not make a huge layer."""
-        W, H, dw, dh = p.get("W"), p.get("H"), p.get("dw", 0), p.get("dh", 0)
-        if not W or dw < 1 or dh < 1: return m, m
+    def _spill_pad(p, iw, ih, ratio=False):
+        """(px, py): how many picture pixels an effect may draw outside the media, on each side. It reaches as far as the picture frame (nothing
+        is seen beyond it), in steps of 1/8 of the media size so that moving the media does not change the layer on every frame, and within a
+        pixel budget so a small media does not make a huge layer."""
+        W, H, dw, dh = p["W"], p["H"], p["dw"], p["dh"]
+        if dw < 1 or dh < 1: return 0, 0
         cx, cy = p["cx"], p["cy"]
-        if abs(p.get("rot", 0)) > 0.01: far = math.hypot(max(cx, W - cx), max(cy, H - cy)); hx = hy = far
+        if abs(p["rot"]) > 0.01: hx = hy = math.hypot(max(cx, W - cx), max(cy, H - cy))
         else: hx, hy = max(cx, W - cx), max(cy, H - cy)
-        fx, fy = max(m, (hx - dw / 2) / dw), max(m, (hy - dh / 2) / dh)
-        cap = max(1.3 * W * H / (dw * dh), (1 + 2 * m) ** 2); s = 1.0      # Patch 46: about the size of the picture frame at most
-        for _ in range(12):
-            mx, my = m + (fx - m) * s, m + (fy - m) * s
-            if (1 + 2 * mx) * (1 + 2 * my) <= cap: break
+        ax = math.ceil(max(0.0, (hx - dw / 2) / dw) * 8) / 8.0; ay = math.ceil(max(0.0, (hy - dh / 2) / dh) * 8) / 8.0       # a part of the media size
+        cap = max(1.6 * W * H / (dw * dh), 2.25); s = 1.0                  # area of the layer / area of the media
+        for _ in range(16):
+            if (1 + 2 * ax * s) * (1 + 2 * ay * s) <= cap: break
             s *= 0.8
-        return mx, my
+        if ratio: return ax * s, ay * s
+        return int(round(iw * ax * s)), int(round(ih * ay * s))
+    def spill_ratio(self, proj, c, t):
+        """(ax, ay): how far an effect that spills may draw beyond each side of the media, as a part of the media width / height (what the
+        preview overlay needs to find a point of the padded picture on the screen). (0, 0) when the clip does not spill."""
+        try:
+            if not clip_spills(c): return 0.0, 0.0
+            p = self._plan(proj, node_apply(proj, c, t), t, 1.0)
+            return self._spill_pad(p, 1, 1, ratio=True) if p else (0.0, 0.0)
+        except Exception: return 0.0, 0.0
+    def _pad_for_spill(self, p, img):
+        """The media with an empty border around it, for effects that draw outside the media: (picture, (x0, y0, x1, y1) of the media in it).
+        The media keeps its size and place: the plan is told that the layer is that much bigger, around the same centre."""
+        ih, iw = img.shape[:2]; px, py = self._spill_pad(p, iw, ih); big = np.zeros((ih + 2 * py, iw + 2 * px, 4), np.uint8)
+        if img.ndim == 3 and img.shape[2] == 3: big[py:py + ih, px:px + iw, :3] = img; big[py:py + ih, px:px + iw, 3] = 255
+        else: big[py:py + ih, px:px + iw] = img
+        fx_, fy_ = big.shape[1] / float(iw), big.shape[0] / float(ih)
+        for key, f in (("bw", fx_), ("bh", fy_), ("dw", fx_), ("dh", fy_)): p[key] *= f
+        return big, (px, py, px + iw, py + ih)
     def _fx_scale(self, c):
         st = self.__dict__.setdefault("_fx_s", {}).get(c["id"]); return st["s"] if st else 1.0
     def _fx_note(self, cid, ms):
@@ -336,25 +420,29 @@ class Renderer:
     def _effects_cached(self, c, img, p, fast, inner=None, bg=None):
         """Effects and masks act on the picture before it is placed. The result is kept for the same clip, effects and time,
         so moving or fading a clip that has effects does not compute the effects again.
+        An effect stack that does not depend on time (no keyframes, never reads the clip time) on media that does not change (a still picture,
+        text) gives the same picture at every moment, so one result is kept for all of them: a still image with effects is drawn once.
         bg: BGR canvas snapshot for copy_background; when present the cache is bypassed (bg changes every frame)."""
         lt = p["lt"]; k = img.shape[1] / max(1.0, float(p["bw"]))
         if c["kind"] in ("compound",): return self.apply_color(c, img, k=k, lt=lt, fast=fast, bg=bg)
         # Detect whether this clip uses copy_background so we know whether to skip the cache.
         _uses_copy_bg = any(e.get("type") == "copy_background" for e in (c.get("effects") or []) if e.get("on", True))
         if not _uses_copy_bg:
-            # Build a cache key.  json.dumps is accurate but slow for clips with many
-            # effects; use the renderer version (bumped on every edit) as an extra
-            # discriminator so we can skip re-serialising when nothing changed.
             sig = json.dumps([c.get("effects"), c.get("mask"), c.get("mask_shape"), c.get("mask_feather"), c.get("mask_layers"),
                               (c.get("text"), c.get("font"), c.get("fsize"), c.get("tcolor"), c.get("stroke"), c.get("scolor"), c.get("bold")) if c["kind"] == "text" else None],
                              sort_keys=True, default=str)
-            key = (c["id"], c.get("path"), round(src_time(c, lt), 4), round(lt, 4), sig, img.shape, bool(fast), inner)
+            moving = c["kind"] in ("video", "gif")                       # the media itself changes with time
+            static_id = (c["id"], sig); still = self._fx_still.get(static_id, False) and not moving
+            key = (c["id"], c.get("path"), round(src_time(c, lt), 4) if moving else None, None if still else round(lt, 4), sig, img.shape, bool(fast), inner)
             with self._fx_lock:
                 hit = self._fx_cache.get(key)
                 if hit is not None: self._fx_cache.move_to_end(key); return hit
             t0 = time.perf_counter(); out = self.apply_color(c, img, k=k, lt=lt, fast=fast, inner=inner, bg=None)
             if self.live_play and getattr(_TLS, "preview", False): self._fx_note(c["id"], (time.perf_counter() - t0) * 1000.0)
             if out is not None:
+                if not moving and not time_used():                      # learned from this run: the picture is the same at every moment
+                    if len(self._fx_still) > 512: self._fx_still.clear()
+                    self._fx_still[static_id] = True; key = key[:3] + (None,) + key[4:]
                 with self._fx_lock:
                     self._fx_cache[key] = out; self._fx_bytes += out.nbytes
                     while (len(self._fx_cache) > 32 or self._fx_bytes > 200e6) and len(self._fx_cache) > 1:
@@ -378,7 +466,7 @@ class Renderer:
         # All non-normal modes now use the fast uint8/uint16 path in fastcomp.blend_mode
         # (2-3x faster than the old float32 conversion for most modes).
         blend_mode(roi, bgr, alpha, op, blend)
-    def _draw_cpu(self, canvas, p, q, fast, precise, bg=None):
+    def _draw_cpu(self, canvas, p, q, fast, precise, bg=None, acc=None):
         img, opaque = self._layer_image(p, q, fast, bg=bg)
         if img is None: return
         H, W = canvas.shape[:2]; c = p["c"]; ih, iw = img.shape[:2]
@@ -409,6 +497,7 @@ class Renderer:
             if cv2.countNonZero(cv2.compare(a, 255, cv2.CMP_LT)): alpha = a
             part = cv2.cvtColor(part, cv2.COLOR_BGRA2BGR)
         self._blend_roi(canvas[y0:y1, x0:x1], part, alpha, p["op"], c.get("blend", "normal"))
+        if acc is not None: _acc_alpha(acc[y0:y1, x0:x1], alpha, p["op"])        # Patch 53: the alpha of the picture is added up next to it
 
     # ---------------------------------------------------------------- one frame
     def render(self, proj, t, q, fast=False):
@@ -420,7 +509,7 @@ class Renderer:
         bg = QColor(proj.bg); bgr = (bg.blue(), bg.green(), bg.red())
         plans = self._plans(proj, t, q, W, H)
         gpu = GPU if (depth == 0 and getattr(_TLS, "preview", False) and plans) else None
-        if gpu is not None and all(p["c"].get("blend", "normal") == "normal" for p in plans):
+        if gpu is not None and all(p["c"].get("blend", "normal") == "normal" and not any(e.get("type") == "copy_background" and e.get("on", True) for e in (p["c"].get("effects") or [])) for p in plans):
             try:
                 if gpu.usable():
                     layers = []
@@ -449,6 +538,24 @@ class Renderer:
                 self._draw_cpu(canvas, p, q, fast, precise, bg=bg_snap)
             except Exception as ex: print("composite error:", ex)
         return canvas
+    def render_alpha(self, proj, t, q):
+        """Patch 53: one frame drawn over a transparent canvas, in ONE pass: (picture over black, alpha), both uint8. The alpha is added up
+        while the layers are drawn (normal compositing, so it is exact). None when a layer uses a blend mode or copy_background: those
+        need the old black-and-white way (see CompoundSource)."""
+        depth = getattr(_TLS, "depth", 0); _TLS.depth = depth + 1
+        try:
+            W, H = max(2, int(round(proj.w * q))), max(2, int(round(proj.h * q)))
+            plans = self._plans(proj, t, q, W, H)
+            for p in plans:
+                c = p["c"]
+                if c.get("blend", "normal") != "normal": return None
+                if any(e.get("type") == "copy_background" and e.get("on", True) for e in (c.get("effects") or [])): return None
+            canvas = np.zeros((H, W, 3), np.uint8); acc = np.zeros((H, W), np.uint8); precise = q >= 0.999
+            for p in plans:
+                try: self._draw_cpu(canvas, p, q, False, precise, acc=acc)
+                except Exception as ex: print("composite error:", ex)
+            return canvas, acc
+        finally: _TLS.depth = depth
     def apply_color(self, c, img, k=1.0, lt=0.0, fast=False, inner=None, bg=None):
         img = apply_effects(c, img, k, lt, fast, inner, bg=bg)
         if img is None or img.ndim != 3 or img.shape[2] != 4 or not clip_has_mask(c): return img
@@ -467,6 +574,32 @@ class Renderer:
         return img
 
 
+def _alpha_of(black, white):
+    """Alpha (uint8, 0..255) from the same picture drawn over black and over white: 255 - mean(white - black). Patch 38: all in 8 bit with OpenCV
+    (the old version used int16 / float32 numpy on the whole frame, 40+ ms at 1080p, every frame of a compound clip)."""
+    d = cv2.subtract(white, black)
+    g = cv2.transform(d, np.full((1, d.shape[2]), 1.0 / d.shape[2], np.float32)) if d.ndim == 3 else d
+    g = g.reshape(g.shape[:2]) if g.ndim == 3 else g
+    return cv2.bitwise_not(g)          # 255 - g
+
+
+def _unmatte(over_black, alpha):
+    """Straight-alpha BGRA from a picture over black (= colour * alpha) and its alpha."""
+    al = np.maximum(alpha, 1)
+    col = cv2.divide(over_black, cv2.merge([al, al, al]), scale=255.0)
+    return cv2.merge([col[..., 0], col[..., 1], col[..., 2], alpha])
+
+
+def _acc_alpha(roi, alpha, op):
+    """Patch 53: alpha plane of a transparent canvas after one more layer: roi = a + roi * (1 - a), with a = layer alpha * opacity."""
+    if alpha is None:
+        if op >= 0.999: roi[...] = 255
+        else: roi[...] = cv2.convertScaleAbs(roi, alpha=1.0 - op, beta=op * 255.0)
+        return
+    a = cv2.convertScaleAbs(alpha, alpha=op) if op < 0.999 else alpha
+    roi[...] = cv2.add(a, cv2.multiply(roi, cv2.bitwise_not(a), scale=1.0 / 255))
+
+
 class CompoundSource:
     def __init__(self, c, renderer):
         self.c = c; self.r = renderer
@@ -476,20 +609,34 @@ class CompoundSource:
         p.clips = self.c.get("children", []); p.tracks = self.c.get("subtracks", []); p.bg = bg
         return self.r.render(p, float(t), ds, False)
     def frame_auto(self, t, ds=1.0):
-        """(picture, opaque). The compound clip keeps its transparency (Patch 40): it is drawn once over black and once over white;
-        where the two differ nothing is drawn there, and the difference tells how transparent it is (exact for normal compositing)."""
+        """(picture, opaque). Patch 53: ONE pass. The clips inside are drawn over a transparent canvas and their alpha is added up next to the
+        picture (exact for normal compositing). A compound inside a compound now costs one pass per level; before it was two to four, and
+        it doubled with every level. A blend mode / copy_background inside still uses the old black-and-white way."""
         key = (round(float(t), 4), ds); cache = self.__dict__.setdefault("_ac", OrderedDict()); hit = cache.get(key)
         if hit is not None: cache.move_to_end(key); return hit
-        a = self._over(t, ds, "#000000"); pd = max(0.125, min(0.25, ds * 0.25))
-        tb = self._over(t, pd, "#000000"); tw = self._over(t, pd, "#ffffff")       # Patch 46: a tiny test first; the second full render only if something is transparent
-        if float((255.0 - (tw.astype(np.int16) - tb.astype(np.int16)).mean(axis=2)).min()) >= 250.0: res = (a, True)
+        r = self._alpha_pass(t, ds)
+        if r is None: res = self._frame_auto_bw(t, ds)
         else:
-            b = self._over(t, ds, "#ffffff"); alpha = np.clip(255.0 - (b.astype(np.int16) - a.astype(np.int16)).mean(axis=2), 0, 255)
-            af = np.maximum(alpha / 255.0, 1e-3)[..., None]
-            res = (np.dstack([np.clip(a.astype(np.float32) / af, 0, 255).astype(np.uint8), alpha.astype(np.uint8)]), False)
+            pic, alpha = r
+            res = (pic, True) if cv2.minMaxLoc(alpha)[0] >= 250 else (_unmatte(pic, alpha), False)
         cache[key] = res
-        while len(cache) > 6: cache.popitem(last=False)
+        while len(cache) > 12: cache.popitem(last=False)
         return res
+    def _alpha_pass(self, t, ds):
+        p = Project("compound", self.w, self.h, self.fps)
+        p.clips = self.c.get("children", []); p.tracks = self.c.get("subtracks", [])
+        return self.r.render_alpha(p, float(t), ds)
+    def _frame_auto_bw(self, t, ds):
+        """The old way (Patch 40): drawn once over black and once over white; where the two differ nothing is drawn there."""
+        a = self._over(t, ds, "#000000"); pd = max(0.125, min(0.25, ds * 0.25))
+        if getattr(self, "_was_transparent", False): opaque = False
+        else:
+            tb = self._over(t, pd, "#000000"); tw = self._over(t, pd, "#ffffff")
+            opaque = bool(_alpha_of(tb, tw).min() >= 250)
+        if opaque: return (a, True)
+        b = self._over(t, ds, "#ffffff"); alpha = _alpha_of(a, b)
+        if alpha.min() >= 250: self._was_transparent = False; return (a, True)
+        self._was_transparent = True; return (_unmatte(a, alpha), False)
     def frame_bgr(self, t, ds=1.0):
         img, opaque = self.frame_auto(t, ds); return img if opaque else np.ascontiguousarray(img[..., :3])
     def frame(self, t, ds=1.0):
@@ -557,6 +704,9 @@ class RenderWorker(QThread):
         self.wait(2000)
     def run(self):
         _TLS.preview = True
+        try:                                  # Patch 35: this is the only thread that may run OpenGL effect chains
+            from . import glfx; glfx.enable_current_thread()
+        except Exception: pass
         if CFG.get("low_priority", True): lower_thread_priority()
         while True:
             with self.cv:

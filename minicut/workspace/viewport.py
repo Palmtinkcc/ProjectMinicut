@@ -4,6 +4,7 @@ from ..shared.theme import *
 from ..shared.core import *
 from ..shared.icons import *
 from ..render.audio import *
+from .viewport_points import PointOverlay
 
 
 def snap_angle(a):
@@ -14,7 +15,7 @@ def snap_angle(a):
     return float(n) if abs(a - n) <= 3 else a
 
 
-class Viewport(QWidget):
+class Viewport(QWidget, PointOverlay):
     def __init__(self, app):
         super().__init__(); self.app = app; self.img = None; self.zoom = 1.0; self.pan = QPointF(); self.drag = None
         self.guides = []; self.setMouseTracking(True); self.setMinimumSize(1, 1); self.setAcceptDrops(True)
@@ -187,6 +188,7 @@ class Viewport(QWidget):
             if d and d.get("mode") == "marquee" and d.get("moved"):
                 mc = QColor(UI["marquee"]); fc = QColor(mc); fc.setAlpha(50)
                 p.setPen(QPen(mc, 1)); p.setBrush(fc); p.drawRect(QRectF(d["p0"], d["p"]).normalized())
+            self._pt_paint(p)          # effect centre points (Effects tab) / origin of the media (Origin card)
         self._paint_meter(p); self._paint_fps(p)
     def _hit(self, pos):
         c = self.app.sel_clip()
@@ -202,6 +204,7 @@ class Viewport(QWidget):
         if not app.proj or getattr(app, "_mprev", None) is not None: return
         if e.button() == Qt.MiddleButton: self.drag = {"mode": "pan", "p": pos, "pan": QPointF(self.pan)}; return
         if e.button() != Qt.LeftButton: return
+        if self._pt_press(e): return        # an effect centre / the origin was grabbed
         mod = bool(e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)); ids = self._multi_ids()
         if ids and not mod:        # several clips selected: drag any of them to move all together
             hit = None
@@ -235,6 +238,7 @@ class Viewport(QWidget):
     def _move_core(self, e):
         pos = e.position(); app = self.app
         if not app.proj: return
+        if self._pt_move(e): return          # hover / drag of an effect centre or the origin
         d = self.drag
         if not d:
             _, n = self._hit(pos)
@@ -295,7 +299,7 @@ class Viewport(QWidget):
             set_prop(c, "rot", lt, round(nr, 2))
         app.request_render(); self.update(); app.inspector.refresh()
     def mouseReleaseEvent(self, e):
-        d = self.drag; self.drag = None; self.guides = []
+        d = self.drag; self.drag = None; self.guides = []; self._pt_release(d)
         if d and d.get("mode") == "marquee":
             if not d["moved"] and not d["base"]: self.app.set_multi(set())
         elif d and d.get("clip"): self.app.commit(d["before"]); self.app.on_changed()

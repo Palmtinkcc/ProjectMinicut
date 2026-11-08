@@ -19,18 +19,28 @@ try:
 except Exception:
     _GPU_FX = False
 
-_REF = threading.local()      # Patch 46: size of the media inside a spilled layer, for effects that size themselves from the picture
-# Effects whose look depends on the size of the whole layer (checked one by one: with spill on, the picture inside the media was not the same as with it
-# off). They always run on the media alone, so on and off look the same, and the Spill switch is not shown for them.
-SPILL_UNSUPPORTED = frozenset({
-    "antifisheye", "area_blur", "bend", "bitdepth", "blockdissolve", "bounce", "breakwipe", "checkwipe", "circlewipe",
-    "crt", "crystallize", "deadgpu", "fadenoise", "fbmfade", "feather", "fisheye", "fluidcurl", "fluidwarp",
-    "fractalwarp", "glitch", "grain", "lensdist", "lensdistrgb", "lensorb", "liquidwave", "liquidwipe", "melting",
-    "noiseglitch", "noiseover", "offsetglitch", "opticcomp", "pinch", "pixelglitch", "polar", "psykoblobs",
-    "randompattern", "refraction", "repgrid", "reppath", "repscatter", "rgbglitch", "scatterglitch", "shatter",
-    "sliceglitch", "squarebreak", "squeeze", "swing", "swirl", "tiles", "turbdisp", "twist", "vcr", "vhsnoise",
-    "vignette", "waterwave", "zoomblur"
-})
+try:                              # Patch 35: OpenGL effect chains (needs moderngl; any problem -> the CPU effects run as before)
+    from . import glfx as _GLX
+except Exception:
+    _GLX = None
+
+_REF = threading.local()      # the media inside a picture that has an empty border around it (spill): 3D objects and effects that size themselves from the picture read it
+_TIME = threading.local()     # set while an effect stack runs and something in it depends on the clip time (ctx.lt read, or keyframes)
+
+
+class _Ctx:
+    """What an effect function gets next to its parameters. Reading .lt is noted: an effect that never reads the time gives the same
+    picture at every moment, so the renderer can keep that picture instead of drawing it again for every frame."""
+    def __init__(self, k, lt, fast, clip=None, holder=None, progress_keyframed=False, bg=None):
+        self.k = k; self._lt = lt; self.fast = fast; self.clip = clip; self.holder = holder if holder is not None else {}
+        self.progress_keyframed = progress_keyframed; self.bg = bg
+    @property
+    def lt(self): _TIME.used = True; return self._lt
+
+
+def time_used():
+    """True when the effect stack that ran last on this thread depends on the clip time."""
+    return bool(getattr(_TIME, "used", False))
 
 
 def ref_crop(img):
@@ -38,6 +48,12 @@ def ref_crop(img):
     r = getattr(_REF, "rect", None)
     if not r: return img
     x0, y0, x1, y1 = r; return np.ascontiguousarray(img[y0:y1, x0:x1])
+
+
+def ref_origin():
+    """(x, y) of the top left corner of the media inside a picture with an empty border around it; (0, 0) when the picture is the media."""
+    r = getattr(_REF, "rect", None)
+    return (r[0], r[1]) if r else (0, 0)
 
 
 def ref_size(h, w):
@@ -70,13 +86,10 @@ def new_effect(type_):
     return {"id": new_id(), "type": type_, "on": True, "spill": False, "p": fx_defaults(type_)}
 
 
-SPILL_MARGIN = 0.25          # how far (as a part of the media size, on every side) an effect may spill outside the media
-
-
-def spill_margin(c):
-    """> 0 when an effect layer of the clip may draw outside the media (the picture is then made larger, with an empty border)."""
-    if c.get("kind") in ("compound",): return 0.0
-    return SPILL_MARGIN if any(e.get("on", True) and e.get("spill") and e.get("type") in FX and e.get("type") not in SPILL_UNSUPPORTED for e in (c.get("effects") or [])) else 0.0
+def clip_spills(c):
+    """True when an effect layer of the clip may draw outside the media (the renderer then gives the picture an empty border to draw in)."""
+    if c.get("kind") == "compound": return False
+    return any(e.get("on", True) and e.get("spill") and e.get("type") in FX for e in (c.get("effects") or []))
 
 
 def _rainbow(): return [(i / 6.0, QColor.fromHsvF(min(i / 6.0, 0.999), 1.0, 1.0)) for i in range(7)]
@@ -154,46 +167,118 @@ def _effect_param_value(e, key, lt, fallback):
     return ks[-1]["v"]
 
 
+_lane_ok = lambda e: False        # replaced by fastfx.lane_ok when the fast effects are installed
+
+
+def _effect_params(e, spec, lt):
+    """The cleaned parameters of an effect layer at clip time lt (animated parameters evaluated)."""
+    params = clean_params(spec, e.get("p", {}))
+    # Evaluate each animated parameter at the clip-local playhead time before
+    # calling the effect. A keyframed Progress track must take precedence over
+    # the effect's autonomous timer; otherwise prog() replaces the interpolated
+    # value and the effect appears to stop/change incorrectly between keyframes.
+    for key, _, kind, dflt, lo, hi in spec["params"]:
+        track = (e.get("keys") or {}).get(key) or []
+        if track:
+            _TIME.used = True
+            params[key] = _effect_param_value(e, key, lt, params.get(key, dflt))
+    return clean_params(spec, params)
+
+
+_LIGHT_FX = frozenset({"glow", "soft_glow"})      # glows: the light is new picture, so it has to show where the media is see-through too
+
+
+def _see_through(img):
+    return img.shape[2] == 4 and cv2.minMaxLoc(cv2.extractChannel(img, 3))[0] < 255
+
+
+def _run_fx(c, img, e, spec, k, lt, fast, inner, bg):
+    """One effect function on a BGRA picture. A failing effect is skipped, never fatal.
+    inner: (x0, y0, x1, y1) of the media inside this picture when it has an empty border around the media, else None."""
+    ctx = _Ctx(max(1e-3, float(k)), lt, fast, clip=c, holder=e.get("p", {}), progress_keyframed=bool((e.get("keys") or {}).get("progress")), bg=bg)      # bg: BGR canvas behind this layer (may be None)
+    try:
+        params = _effect_params(e, spec, lt); ctx.holder = params
+        _REF.hw = (inner[3] - inner[1], inner[2] - inner[0]) if inner is not None else None; _REF.rect = inner
+        work = img; light = e.get("type") in _LIGHT_FX and _see_through(img)
+        if light:       # work on the colours over black (an opaque picture): what the glow adds is then new picture, and gets an alpha below
+            a = np.ascontiguousarray(img[..., 3]); work = np.empty_like(img)
+            work[..., :3] = cv2.multiply(np.ascontiguousarray(img[..., :3]), cv2.merge((a, a, a)), scale=1 / 255.0); work[..., 3] = 255
+        out = spec["fn"](work, params, ctx)
+        if out is None or out.shape != work.shape or out.dtype != np.uint8: return img
+        if light:
+            al = np.maximum(a, out[..., :3].max(-1)); res = np.empty_like(out)
+            res[..., :3] = cv2.divide(np.ascontiguousarray(out[..., :3]), cv2.merge((al, al, al)), scale=255.0); res[..., 3] = al; out = res
+        return out
+    except Exception as ex: print("[effects]", e.get("type"), ex); return img
+    finally: _REF.hw = None; _REF.rect = None
+
+
+def _apply_one(c, img, e, spec, k, lt, fast, inner, bg, lane):
+    """One effect layer on the CPU.
+    With `inner` (the picture has an empty border, see Renderer._pad_for_spill) an effect with Spill on works on the whole picture, so it can draw
+    in the border. An effect with Spill off works on the media alone, exactly as on a picture without a border, and what is outside the media
+    stays as the effects before it left it."""
+    if img.shape[2] == 3 and not (lane is not None and lane(e)): img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    if inner is None or e.get("spill"): return _run_fx(c, img, e, spec, k, lt, fast, inner, bg)
+    x0, y0, x1, y1 = inner
+    img[y0:y1, x0:x1] = _run_fx(c, np.ascontiguousarray(img[y0:y1, x0:x1]), e, spec, k, lt, fast, None, bg)       # img is this layer's own array, never a cached one
+    return img
+
+
+def _gl_run(c, fx, i, img, k, lt, fast, bg, lane, inner=None):
+    """Patch 35: the run of effects that starts at fx[i] and that the GPU library knows is done as ONE GPU job (one upload, one read-back),
+    or on the CPU, whichever the Chooser measured to be faster for this combination and picture size.
+    Returns (picture, index of the next effect) or None when the CPU should do effect i by itself (not supported / GL off / GL error)."""
+    items = []; idx = []; see = _see_through(img)
+    for j in range(i, len(fx)):
+        e = fx[j]
+        if not e.get("on", True): continue
+        t = e.get("type"); spec = FX.get(t)
+        if spec is None: continue
+        if spec.get("area") or not _GLX.supported(t): break
+        if inner is not None and not e.get("spill"): break          # this one stays inside the media: the CPU path crops it
+        if see and t in _LIGHT_FX: break                            # see-through media: see _run_fx
+        try: items.append((t, _effect_params(e, spec, lt))); idx.append(j)
+        except Exception: break
+    if not items: return None
+    plan = _GLX.build_chain(img, items, _Ctx(max(1e-3, float(k)), lt, fast))
+    if plan is None: return None
+    n = plan.n; end = idx[n - 1] + 1; h, w = img.shape[:2]
+    key = (tuple(t for t, _ in items[:n]), (w * h) >> 15)
+    pick = _GLX.CHOOSER.pick(key); t0 = _GLX.now_ms()
+    if pick == "gl":
+        try: out = _GLX.execute(img, plan)
+        except Exception as ex: _GLX.fail("drawing failed: %s" % (ex,)); return None
+        _GLX.CHOOSER.report(key, "gl", _GLX.now_ms() - t0); return out, end
+    out = img
+    for j in range(i, end):
+        e = fx[j]; spec = FX.get(e.get("type"))
+        if e.get("on", True) and spec is not None: out = _apply_one(c, out, e, spec, k, lt, fast, inner, bg, lane)
+    _GLX.CHOOSER.report(key, "cpu", _GLX.now_ms() - t0); return out, end
+
+
 def apply_effects(c, img, k=1.0, lt=0.0, fast=False, inner=None, bg=None):
     """Run the clip's effect stack on a BGRA image.  A failing effect is skipped, never fatal.
+    inner: (x0, y0, x1, y1) of the media when `img` is the media with an empty border around it (see Renderer._pad_for_spill).
     bg: optional BGR uint8 canvas snapshot (the composited frame up to but not including this layer),
         used by copy_background and other composite-aware effects."""
+    _TIME.used = False
     fx = c.get("effects")
     if not fx or img is None or img.ndim != 3: return img
     if img.dtype != np.uint8: img = np.clip(img, 0, 255).astype(np.uint8)
-    if img.shape[2] == 3: img = np.dstack([img, np.full(img.shape[:2], 255, np.uint8)])
-    for e in fx:
-        if not e.get("on", True): continue
-        spec = FX.get(e.get("type"))
-        if spec is None: continue
-        ctx = SimpleNamespace(k=max(1e-3, float(k)), lt=lt, fast=fast, clip=c, holder=e.get("p", {}),
-                              progress_keyframed=bool((e.get("keys") or {}).get("progress")),
-                              bg=bg)   # BGR canvas behind this layer (may be None)
-        inside_only = inner is not None and not (e.get("spill", False) and e.get("type") not in SPILL_UNSUPPORTED)      # runs on the media alone, exactly as without spill
-        try:
-            params = clean_params(spec, e.get("p", {}))
-            # Evaluate each animated parameter at the clip-local playhead time before
-            # calling the effect. A keyframed Progress track must take precedence over
-            # the effect's autonomous timer; otherwise prog() replaces the interpolated
-            # value and the effect appears to stop/change incorrectly between keyframes.
-            for key, _, kind, dflt, lo, hi in spec["params"]:
-                track = (e.get("keys") or {}).get(key) or []
-                if track:
-                    params[key] = _effect_param_value(e, key, lt, params.get(key, dflt))
-            params = clean_params(spec, params)
-            ctx.holder = params
-            if inside_only:
-                x0, y0, x1, y1 = inner; work = np.ascontiguousarray(img[y0:y1, x0:x1])
-            else:
-                work = img; _REF.hw = (inner[3] - inner[1], inner[2] - inner[0]) if inner is not None else None; _REF.rect = inner
-            out = spec["fn"](work, params, ctx)
-            if out is not None and out.shape == work.shape and out.dtype == np.uint8:
-                if inside_only: img = np.zeros_like(img); img[y0:y1, x0:x1] = out
-                else: img = out
-        except Exception as ex: print("[effects]", e.get("type"), ex)
-        finally: _REF.hw = None; _REF.rect = None
-        if inner is not None and inside_only:        # not allowed to spill: whatever went outside the media is cut off
-            x0, y0, x1, y1 = inner; img = img.copy(); img[:y0, :, 3] = 0; img[y1:, :, 3] = 0; img[:, :x0, 3] = 0; img[:, x1:, 3] = 0
+    # Patch 34: a 3-channel (BGR) picture stays 3-channel while the effects in the stack can work on it (see fastfx.lane_ok); it is widened
+    # to BGRA once, at the first effect that needs the alpha plane.
+    lane = _lane_ok if img.shape[2] == 3 and inner is None else None
+    i = 0; n = len(fx)
+    while i < n:
+        e = fx[i]; spec = FX.get(e.get("type"))
+        if not e.get("on", True) or spec is None: i += 1; continue
+        # Patch 35: runs of GPU-capable effects go through OpenGL (preview thread only)
+        if _GLX is not None and (inner is None or e.get("spill")) and _GLX.active():
+            try: done = _gl_run(c, fx, i, img, k, lt, fast, bg, lane, inner)
+            except Exception as ex: _GLX.fail("effect chain: %s" % (ex,)); done = None
+            if done is not None: img, i = done; continue
+        img = _apply_one(c, img, e, spec, k, lt, fast, inner, bg, lane); i += 1
     return img
 
 
@@ -209,24 +294,18 @@ def _unpremul(pm, a):
 
 
 def _gauss(arr, sigma):
-    """Gaussian blur; GPU separable shader when available, CPU fallback otherwise."""
+    """Gaussian blur (float32 or uint8, any channel count). Patch 34: a blur of sigma >= 3 runs on a shrunken copy (the result is smooth
+    anyway), so the cost stays small for any radius; the GPU round trip of the old version is gone (it was slower than this on most PCs)."""
     if sigma < 0.35: return arr
-    # GPU path: works on float32 or uint8, any channel count
-    if _GPU_FX and arr.dtype == np.uint8 and arr.ndim == 3 and arr.shape[2] == 4:
-        try:
-            return gpu_gaussian_blur(arr, sigma)
-        except GpuFxUnavailable:
-            pass
-        except Exception:
-            pass
-    # CPU fallback (original logic)
     h, w = arr.shape[:2]
-    if sigma > 6:
-        f = 4.0 / sigma; sw, sh = max(1, int(w * f)), max(1, int(h * f))
-        small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA); s = 4.0
-        kk = int(s * 3) * 2 + 1; small = cv2.GaussianBlur(small, (kk, kk), s)
-        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
-    kk = int(sigma * 3) * 2 + 1; return cv2.GaussianBlur(arr, (kk, kk), sigma)
+    f = 1 if sigma < 3.0 else int(min(8, max(2, sigma / 1.5)))
+    if f == 1:
+        kk = int(sigma * 3) * 2 + 1; return cv2.GaussianBlur(arr, (kk, kk), sigma)
+    sw, sh = max(1, w // f), max(1, h // f); rs = w / float(sw)
+    small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
+    s = math.sqrt(max(sigma * sigma - rs * rs * 0.25, 0.04)) / rs; kk = int(s * 3) * 2 + 1
+    small = cv2.GaussianBlur(small, (kk, kk), s)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def blur_bgra(img, sigma):
@@ -1238,6 +1317,26 @@ register("luma_key", "Key", "Luma Key",
          fx_luma_key,
          help="Remove pixels by luminance. Key darks out = keep bright areas; Key brights out = keep darks.")
 
+from . import smartkey as _sk
+register("smart_key", "Key", "Better Chroma Key",
+         [("mode", "Mode", "choice", "color", _sk.MODE_CHOICES, None),
+          ("color", "Background color", "color", "#00ff00", None, None),
+          ("tolerance", "Tolerance", "float", 35.0, 0.0, 100.0),
+          ("softness", "Edge softness", "float", 25.0, 0.0, 100.0),
+          ("spill", "Remove color spill", "float", 60.0, 0.0, 100.0),
+          ("quality", "Render quality", "choice", "normal", _sk.QUALITY_CHOICES, None),
+          ("edge_mode", "Edge color", "choice", "auto", _sk.EDGE_CHOICES, None),
+          ("edge_color", "Edge color", "color", "#303030", None, None),
+          ("edge_width", "Edge width", "float", 3.0, 0.0, 20.0),
+          ("edge_amount", "Edge amount", "float", 70.0, 0.0, 100.0),
+          ("choke", "Shrink / grow edge", "float", 0.0, -20.0, 20.0),
+          ("feather", "Feather", "float", 0.0, 0.0, 20.0),
+          ("view", "View", "choice", "result", _sk.VIEW_CHOICES, None)],
+         _sk.fx_smart_key,
+         help="Background color: pick the screen color; the edge of the subject is repainted so no green fringe is left. "
+              "Select object: paint the object, press Render, and the clip is rendered with the background cut away (works on any background). "
+              "Turn the effect off, delete it or press Undo and the original media comes back.")
+
 
 try:
     from . import fxpack      # the effect pack (about 150 more effects); a problem in it must never stop the program
@@ -1249,3 +1348,11 @@ try:
     _load_custom_fx()          # load user-built effects from ~/.minicut/custom_effects/
 except Exception as _ex:
     print("[effects] custom effects not loaded:", _ex)
+
+
+# Patch 34: fast 8-bit versions of the most used effects replace the float32 / GPU round-trip ones (see fastfx.py). Any problem -> the old ones stay.
+try:
+    from . import fastfx as _fastfx
+    _fastfx.install(FX); _lane_ok = _fastfx.lane_ok
+except Exception as _ex:
+    print("[effects] fast effects not installed:", _ex)

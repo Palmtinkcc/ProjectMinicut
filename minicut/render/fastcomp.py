@@ -8,13 +8,6 @@ import cv2
 import numpy as np
 
 
-def _flip_for(raw, sx, sy):
-    if sx < 0 and sy < 0: return cv2.flip(raw, -1)
-    if sx < 0: return cv2.flip(raw, 1)
-    if sy < 0: return cv2.flip(raw, 0)
-    return raw
-
-
 def blend_into(base_roi, top_bgr, alpha, op):
     """Normal blend of top over base_roi in place. alpha: uint8 (h,w) or None (fully opaque). op: 0..1 opacity."""
     if alpha is None:
