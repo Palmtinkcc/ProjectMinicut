@@ -453,13 +453,6 @@ class Renderer:
         if self.live_play and getattr(_TLS, "preview", False): self._fx_note(c["id"], (time.perf_counter() - t0) * 1000.0)
         return out
     @staticmethod
-    def _pixel_exact(p, iw, ih, W, H):
-        """True when the layer is drawn without turning, flipping or scaling, on a whole-pixel position."""
-        if abs(p["rot"]) > 0.01 or p["sx"] <= 0 or p["sy"] <= 0: return False
-        kx, ky = p["bw"] * 1.0 * p["sx"] / 100.0, p["bh"] * 1.0 * p["sy"] / 100.0
-        tx, ty = p["cx"] - iw / 2.0, p["cy"] - ih / 2.0
-        return (abs(p["dw"] - iw) < 1e-3 and abs(p["dh"] - ih) < 1e-3 and abs(tx - round(tx)) < 1e-3 and abs(ty - round(ty)) < 1e-3)
-    @staticmethod
     def _matrix(p, q, iw, ih):
         kx, ky = p["bw"] * q * p["sx"] / 100 / iw, p["bh"] * q * p["sy"] / 100 / ih
         th = math.radians(p["rot"]); cs, sn = math.cos(th), math.sin(th)
@@ -488,13 +481,6 @@ class Renderer:
             if p["sx"] < 0 and p["sy"] < 0: part = cv2.flip(part, -1)
             elif p["sx"] < 0: part = cv2.flip(part, 1)
             elif p["sy"] < 0: part = cv2.flip(part, 0)
-        elif self._pixel_exact(p, iw, ih, W, H):
-            # Patch 36: the picture is placed 1:1 on whole pixels (a full-size video in a project of its size): copying the pixels gives
-            # exactly what the exact-placement warp would (weights 1 and 0), without the warp and the two colour conversions.
-            tx = int(round(p["cx"] - iw / 2.0)); ty = int(round(p["cy"] - ih / 2.0))
-            x0, y0, x1, y1 = max(0, tx), max(0, ty), min(W, tx + iw), min(H, ty + ih)
-            if x1 <= x0 or y1 <= y0: return
-            part = img[y0 - ty:y1 - ty, x0 - tx:x1 - tx]
         else:
             M = to_cv_matrix(self._matrix(p, q, iw, ih))
             corn = M @ np.array([[0, iw, iw, 0], [0, 0, ih, ih], [1, 1, 1, 1]], np.float32)
@@ -672,9 +658,6 @@ def frame_to_qimage(fr):
         return np_to_qimage(fr)
 
 
-_ZOMBIES = []              # render workers that were asked to stop but are still finishing a frame (kept referenced, see RenderWorker.stop)
-
-
 class RenderWorker(QThread):
     ready = Signal(object)
     def __init__(self, renderer):
@@ -716,15 +699,9 @@ class RenderWorker(QThread):
             except RuntimeError:
                 continue                      # the GUI changed the project while it was read: read it again
         return getattr(self, "_snap", live), getattr(self, "_fp", None)
-    def stop(self, timeout=2000):
-        """Patch 36: a render that is still busy after the wait used to be dropped while its thread ran, and Qt ends the whole program
-        with 'QThread: Destroyed while thread is still running' (a rare crash with no visible cause). The worker is now kept alive in
-        _ZOMBIES until its thread has really finished."""
+    def stop(self):
         with self.cv: self.alive = False; self.cv.notify()
-        if not self.wait(timeout) and self.isRunning():
-            _ZOMBIES.append(self)
-            try: self.finished.connect(lambda w=self: _ZOMBIES.remove(w) if w in _ZOMBIES else None)
-            except Exception: pass
+        self.wait(2000)
     def run(self):
         _TLS.preview = True
         try:                                  # Patch 35: this is the only thread that may run OpenGL effect chains

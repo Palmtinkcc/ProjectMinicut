@@ -578,104 +578,8 @@ class ManageDialog(AnimatedDialog):
 
 
 # ── Home screen & project I/O ─────────────────────────────────────────────────
-# ── Home page widgets of the new design (Patch 36) ────────────────────────────
-class _Logo(QWidget):
-    """MINICUT in a blue gradient, VIDEO EDITOR under it."""
-    def __init__(self):
-        super().__init__(); self.setFixedSize(176, 74)
-
-    def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
-        f = QFont(); f.setPixelSize(36); f.setWeight(QFont.Weight.Normal); f.setLetterSpacing(QFont.AbsoluteSpacing, 0.5); p.setFont(f)
-        path = QPainterPath(); path.addText(2, 38, f, "MINICUT")
-        g = QLinearGradient(0, 0, self.width(), 0); g.setColorAt(0.0, QColor("#0a2cff")); g.setColorAt(1.0, QColor("#00b3ff"))
-        p.setPen(Qt.NoPen); p.setBrush(g); p.drawPath(path)
-        f2 = QFont(); f2.setPixelSize(15); p.setFont(f2); p.setPen(QColor("#ffffff")); p.drawText(QRectF(4, 44, self.width() - 4, 22), Qt.AlignLeft | Qt.AlignVCenter, "VIDEO EDITOR")
-
-
-class _NavItem(QWidget):
-    """One entry of the left bar: [star] name. `active` draws the white line under it. Entries without a page yet do nothing when clicked."""
-    clicked = Signal()
-
-    def __init__(self, text, star=False, active=False):
-        super().__init__(); self.text = text; self.star = star; self.active = active; self._hover = False
-        self.setFixedHeight(40); self.setCursor(Qt.PointingHandCursor)
-
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.clicked.emit()
-
-    def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); x = 4
-        if self.star:
-            f = QFont(); f.setPixelSize(15); p.setFont(f); p.setPen(QColor("#ffc60a")); p.drawText(QRectF(0, 0, 18, self.height() - 4), Qt.AlignCenter, "\u2605"); x = 20
-        f = QFont(); f.setPixelSize(20); p.setFont(f); p.setPen(QColor("#ffffff" if (self.active or self._hover) else "#e4e4ea"))
-        p.drawText(QRectF(x, 0, self.width() - x, self.height() - 4), Qt.AlignVCenter | Qt.AlignLeft, self.text)
-        if self.active:
-            p.setPen(Qt.NoPen); p.setBrush(QColor("#ffffff")); p.drawRoundedRect(QRectF(4, self.height() - 7, 112, 5), 2.5, 2.5)
-
-
-class _GradButton(QPushButton):
-    """Big blue gradient button (the + button, Manage). `radius` is the roundness, `plus` draws the + sign instead of a text."""
-    def __init__(self, text="", w=150, h=40, radius=14, plus=False, tip=""):
-        super().__init__(); self.label = text; self.radius = radius; self.plus = plus; self._hover = False; self._down = False
-        self.setFixedSize(w, h); self.setCursor(Qt.PointingHandCursor); self.setToolTip(tip); self.setFlat(True)
-
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
-    def mousePressEvent(self, e): self._down = True; self.update(); super().mousePressEvent(e)
-    def mouseReleaseEvent(self, e): self._down = False; self.update(); super().mouseReleaseEvent(e)
-
-    def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        g = QLinearGradient(r.topLeft(), r.bottomRight())
-        a, b = (("#2a4bff", "#00b8ff") if not self._hover else ("#4466ff", "#2cc4ff"))
-        if self._down: a, b = "#1c38d0", "#0092d0"
-        g.setColorAt(0.0, QColor(a)); g.setColorAt(1.0, QColor(b)); p.setPen(Qt.NoPen); p.setBrush(g); p.drawRoundedRect(r, self.radius, self.radius)
-        p.setPen(QPen(QColor("#ffffff"), max(3.0, self.height() * 0.07), Qt.SolidLine, Qt.RoundCap))
-        if self.plus:
-            c = r.center(); s = self.height() * 0.22
-            p.drawLine(QPointF(c.x() - s, c.y()), QPointF(c.x() + s, c.y())); p.drawLine(QPointF(c.x(), c.y() - s), QPointF(c.x(), c.y() + s))
-        else:
-            f = QFont(); f.setPixelSize(int(self.height() * 0.5)); p.setFont(f); p.setPen(QColor("#ffffff")); p.drawText(r, Qt.AlignCenter, self.label)
-
-
-class _QuickBtn(QWidget):
-    """A quick-design button: a grey rounded box in the shape of the aspect ratio, with its name. One click makes the project."""
-    clicked = Signal()
-
-    def __init__(self, label, w, h, outline=False, tip=""):
-        super().__init__(); self.label = label; self.outline = outline; self._hover = False
-        self.setFixedSize(w, h); self.setCursor(Qt.PointingHandCursor); self.setToolTip(tip)
-
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.clicked.emit()
-
-    def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        p.setBrush(QColor("#7a7a7a" if self._hover else "#666666")); p.setPen(QPen(QColor("#ffffff"), 1.5) if self.outline else Qt.NoPen)
-        p.drawRoundedRect(r, 5, 5)
-        f = QFont(); f.setPixelSize(15 if self.width() >= 64 else 13); p.setFont(f); p.setPen(QColor("#ffffff")); p.drawText(r, Qt.AlignCenter, self.label)
-
-
-def _vline():
-    ln = QFrame(); ln.setFixedWidth(3); ln.setStyleSheet("background:#f2f2f4;border:none;border-radius:1px;"); return ln
-
-
-
-
 class ProjectMixin:
     """Project creation / opening / saving and the home screen."""
-
-    # Quick design: (label, ratio w, ratio h, button size). One click makes a project of that shape at the chosen quality.
-    QUICK_VIDEO_TOP = (("16:9", 16, 9, 96, 40), ("4:3", 4, 3, 76, 40))
-    QUICK_VIDEO_LOW = (("9:16", 9, 16, 44, 78), ("3:4", 3, 4, 58, 70), ("1:1", 1, 1, 48, 48))
-    QUICK_CINE = (("2.35:1", 235, 100, 124, 40), ("1.85:1", 185, 100, 108, 40))
 
     def _build_home(self):
         self._home_bus = _HomeBus(self); self._home_pool = QThreadPool(); self._home_pool.setMaxThreadCount(2)
@@ -683,69 +587,63 @@ class ProjectMixin:
         self._cards = {}; self._storage_rows = []; self._scan_busy = False
 
         root = QHBoxLayout(self.home)
-        root.setContentsMargins(18, 18, 16, 18)
-        root.setSpacing(14)
+        root.setContentsMargins(20, 24, 24, 20)
+        root.setSpacing(18)
 
-        # ── left bar: logo, pages, Settings, links ──
-        left = QVBoxLayout(); left.setSpacing(0); left.setContentsMargins(0, 0, 0, 0)
-        left.addWidget(_Logo()); left.addSpacing(26)
-        nav = [_NavItem("Projects", active=True), _NavItem("Template", star=True), _NavItem("Effects", star=True), _NavItem("Assets", star=True)]
-        for n in nav: left.addWidget(n)         # Template / Effects / Assets have no page yet: a click does nothing
-        left.addStretch()
-        left.addWidget(Btn("Settings", "settings", "soft", "", self.open_settings)); left.addSpacing(10)
-        links = QHBoxLayout(); links.setSpacing(8); links.addWidget(_BrandIcon("github", GITHUB_URL, "GitHub")); links.addWidget(_BrandIcon("youtube", YOUTUBE_URL, "YouTube")); links.addStretch()
-        left.addLayout(links)
-        left_w = QWidget(); left_w.setFixedWidth(176); left_w.setLayout(left)
-        root.addWidget(left_w); root.addWidget(_vline())
+        # left rail: links
+        rail = QVBoxLayout()
+        rail.setSpacing(10)
+        rail.addStretch()
+        rail.addWidget(_BrandIcon("youtube", YOUTUBE_URL, "YouTube"))
+        rail.addWidget(_BrandIcon("github", GITHUB_URL, "GitHub"))
+        root.addLayout(rail)
 
-        # ── centre: create button + quick design on top, the project cards below ──
-        centre = QVBoxLayout(); centre.setSpacing(12)
+        # centre: title, new project, project cards
+        centre = QVBoxLayout()
+        centre.setSpacing(14)
+        head = QHBoxLayout()
+        title = QLabel("MINICUT")
+        title.setObjectName("H1")
+        title.setStyleSheet("font-size:30px;font-weight:800;color:#2f8bff;")
+        head.addWidget(title)
+        head.addStretch()
         q, f = home_defaults(self.settings)
-
-        self._top_box = QBoxLayout(QBoxLayout.LeftToRight); self._top_box.setSpacing(26)
-        plus_col = QVBoxLayout(); plus_col.setSpacing(6)
-        plus = _GradButton(w=380, h=84, radius=26, plus=True, tip="New project: choose the name and the size")
-        plus.setMinimumWidth(240); plus.setMaximumWidth(430); plus.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)     # grows and shrinks with the window
-        plus.clicked.connect(self.new_project)
-        cap = QLabel("Create new Project"); cap.setAlignment(Qt.AlignHCenter); cap.setStyleSheet("color:#8d8d94;font-size:19px;")
-        plus_col.addSpacing(34); plus_col.addWidget(plus); plus_col.addWidget(cap)
-        openb = Btn("Open…", "folder_open", "soft", "Open a project file", self.open_dialog)
-        plus_col.addWidget(openb, 0, Qt.AlignHCenter); plus_col.addStretch()
-        self._plus_w = QWidget(); self._plus_w.setLayout(plus_col)
-
-        quick = QVBoxLayout(); quick.setSpacing(8)
-        qrow = QHBoxLayout(); qrow.addStretch()
-        ql = QLabel("quality"); ql.setStyleSheet("font-size:19px;")
-        self.home_q = QComboBox(); [self.home_q.addItem(n, v) for n, v in QUALITIES]; self.home_q.setCurrentIndex(max(0, self.home_q.findData(q))); self.home_q.setFixedWidth(104)
+        res_lbl = QLabel("Resolution")
+        res_lbl.setObjectName("Dim")
+        self.home_q = QComboBox()
+        [self.home_q.addItem(n, v) for n, v in QUALITIES]
+        self.home_q.setCurrentIndex(max(0, self.home_q.findData(q)))
+        self.home_q.setFixedWidth(104)
         self.home_q.setToolTip("Size of new projects: the short side. 16:9 is 1280×720 at 720p, 1:1 is 720×720.")
-        fl = QLabel("fps"); fl.setStyleSheet("font-size:15px;color:#8d8d94;")
-        self.home_fps = QComboBox(); [self.home_fps.addItem(str(x), x) for x in FPS_CHOICES]; self.home_fps.setCurrentIndex(max(0, self.home_fps.findData(f))); self.home_fps.setFixedWidth(76)
+        fps_lbl = QLabel("FPS")
+        fps_lbl.setObjectName("Dim")
+        self.home_fps = QComboBox()
+        [self.home_fps.addItem(str(x), x) for x in FPS_CHOICES]
+        self.home_fps.setCurrentIndex(max(0, self.home_fps.findData(f)))
+        self.home_fps.setFixedWidth(84)
         self.home_fps.setToolTip("Frame rate of new projects")
-        self.home_q.currentIndexChanged.connect(self._home_defaults_changed); self.home_fps.currentIndexChanged.connect(self._home_defaults_changed)
-        for w_ in (ql, self.home_q, fl, self.home_fps): qrow.addWidget(w_); qrow.addSpacing(6)
-        quick.addLayout(qrow)
-        groups = QHBoxLayout(); groups.setSpacing(16)
-        vid = QVBoxLayout(); vid.setSpacing(6)
-        vt = QLabel("Video"); vt.setStyleSheet("font-size:21px;"); vid.addWidget(vt)
-        r1 = QHBoxLayout(); r1.setSpacing(8)
-        for lab, wr, hr, bw, bh in self.QUICK_VIDEO_TOP: r1.addWidget(self._quick_btn(lab, wr, hr, bw, bh))
-        r1.addStretch(); vid.addLayout(r1)
-        sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet("background:#8d8d94;border:none;"); vid.addWidget(sep)
-        r2 = QHBoxLayout(); r2.setSpacing(8); r2.setAlignment(Qt.AlignBottom)
-        for lab, wr, hr, bw, bh in self.QUICK_VIDEO_LOW: r2.addWidget(self._quick_btn(lab, wr, hr, bw, bh), 0, Qt.AlignBottom)
-        r2.addStretch(); vid.addLayout(r2); vid.addStretch()
-        groups.addLayout(vid)
-        div = QFrame(); div.setFixedWidth(1); div.setStyleSheet("background:#8d8d94;border:none;"); groups.addWidget(div)
-        cin = QVBoxLayout(); cin.setSpacing(6)
-        ct = QLabel("Cinematic"); ct.setStyleSheet("font-size:21px;"); cin.addWidget(ct)
-        for lab, wr, hr, bw, bh in self.QUICK_CINE: cin.addWidget(self._quick_btn(lab, wr, hr, bw, bh))
-        custom = _QuickBtn("Custom", 124, 44, outline=True, tip="Open the New Project window to choose any size"); custom.clicked.connect(self.new_project); cin.addWidget(custom); cin.addStretch()
-        groups.addLayout(cin)
-        quick.addLayout(groups)
-        self._quick_w = QWidget(); self._quick_w.setLayout(quick)
-        self._top_box.addWidget(self._plus_w, 1); self._top_box.addWidget(self._quick_w, 0)
-        top = QWidget(); top.setLayout(self._top_box); self._top = top
-        centre.addWidget(top)
+        self.home_q.currentIndexChanged.connect(self._home_defaults_changed)
+        self.home_fps.currentIndexChanged.connect(self._home_defaults_changed)
+        for w in (res_lbl, self.home_q, fps_lbl, self.home_fps):
+            head.addWidget(w)
+            head.addSpacing(6)
+        centre.addLayout(head)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        plus = QPushButton()
+        plus.setObjectName("Accent")
+        plus.setIcon(app_icon("plus", "#ffffff"))
+        plus.setIconSize(QSize(30, 30))
+        plus.setFixedSize(210, 56)
+        plus.setCursor(Qt.PointingHandCursor)
+        plus.setToolTip("New project")
+        plus.clicked.connect(self.new_project)
+        top.addWidget(plus)
+        top.addWidget(Btn("Open…", "folder_open", "soft", "Open a project file", self.open_dialog), 0, Qt.AlignBottom)
+        top.addWidget(Btn("Settings", "settings", "soft", "", self.open_settings), 0, Qt.AlignBottom)
+        top.addStretch()
+        centre.addLayout(top)
 
         self.home_empty = QLabel("No projects yet. Press + to start your first one.")
         self.home_empty.setObjectName("Dim")
@@ -760,35 +658,28 @@ class ProjectMixin:
         self.home_grid.setAutoFillBackground(False)
         sc.viewport().setAutoFillBackground(False)
         centre.addWidget(sc, 1)
-        centre_w = QWidget(); centre_w.setLayout(centre); centre_w.setMinimumWidth(440)
-        root.addWidget(centre_w, 1); root.addWidget(_vline())
+        root.addLayout(centre, 1)
 
-        # ── right: Memory Used ──
-        right = QVBoxLayout(); right.setSpacing(14)
-        mt = QLabel("Memory Used"); mt.setAlignment(Qt.AlignHCenter); mt.setStyleSheet("font-size:22px;"); right.addWidget(mt)
-        self.home_ring = _StorageRing(); self.home_bars = _StorageBars()
-        right.addWidget(self.home_ring, 0, Qt.AlignHCenter); right.addWidget(self.home_bars); right.addStretch()
-        manage = _GradButton("Manage", w=214, h=46, radius=14, tip="See and delete what MiniCut keeps on the disk"); manage.clicked.connect(self.open_manage)
+        # right: storage ring, bars, Manage
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        self.home_ring = _StorageRing()
+        self.home_bars = _StorageBars()
+        right.addWidget(self.home_ring, 0, Qt.AlignHCenter)
+        right.addWidget(self.home_bars)
+        right.addStretch()
+        manage = QPushButton("Manage")
+        manage.setObjectName("Accent")
+        manage.setFixedSize(150, 34)
+        manage.setCursor(Qt.PointingHandCursor)
+        manage.setToolTip("See and delete what MiniCut keeps on the disk")
+        manage.clicked.connect(self.open_manage)
         right.addWidget(manage, 0, Qt.AlignHCenter)
-        right_w = QWidget(); right_w.setFixedWidth(236); right_w.setLayout(right)
+        right_w = QWidget()
+        right_w.setFixedWidth(250)
+        right_w.setLayout(right)
         root.addWidget(right_w)
         self.home_bars.set_parts(group_totals([]))
-        self.home.installEventFilter(self); self._home_layout_top()
-
-    def _quick_btn(self, label, wr, hr, bw, bh):
-        shown = label
-        b = _QuickBtn(shown, bw, bh, tip="Make a %s project now (%s)" % (shown, "quality and fps from this page")); b.clicked.connect(lambda wr=wr, hr=hr: self.quick_project(wr, hr)); return b
-
-    def eventFilter(self, o, ev):
-        if o is getattr(self, "home", None) and ev.type() == QEvent.Resize: self._home_layout_top()
-        return super().eventFilter(o, ev)
-
-    def _home_layout_top(self):
-        """Narrow window: the quick-design block goes under the + button."""
-        try:
-            narrow = self.home.width() < 1020
-            self._top_box.setDirection(QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight)
-        except Exception: pass
 
     def show_home(self):
         self.finish_record()
@@ -927,17 +818,6 @@ class ProjectMixin:
         if d.exec() != QDialog.Accepted:
             return
         name, w, h, fps = d.data()
-        self._start_project(name, w, h, fps)
-
-    def quick_project(self, wr, hr):
-        """Quick design: a project of this aspect ratio at the quality and fps chosen on the home page, made at once."""
-        dq, df = home_defaults(self.settings)
-        q = getattr(self, "home_q", None); f = getattr(self, "home_fps", None)
-        short = q.currentData() if q else dq; fps = f.currentData() if f else df
-        w, h = size_for(wr, hr, short)
-        self._start_project(f"Project {datetime.datetime.now():%Y-%m-%d %H%M}", w, h, fps)
-
-    def _start_project(self, name, w, h, fps):
         self.proj = Project(name, w, h, fps)
         self.proj.path = None
         self.t = 0

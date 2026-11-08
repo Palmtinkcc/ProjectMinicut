@@ -56,11 +56,10 @@ class Pass:
     out  : "main" (becomes the current result) or the name of a temp target
     size : (w, h) of the output target, None = full size
     """
-    __slots__ = ("frag", "u", "tex", "out", "size", "dt")
+    __slots__ = ("frag", "u", "tex", "out", "size")
 
-    def __init__(self, frag, u=None, tex=None, out="main", size=None, dt="f1"):
+    def __init__(self, frag, u=None, tex=None, out="main", size=None):
         self.frag = frag; self.u = u or {}; self.tex = tex or {"u_in": "main"}; self.out = out; self.size = size
-        self.dt = dt                      # Patch 36: "f1" = 8 bit (default), "f2" = 16 bit float target (for sums that are divided later)
 
 
 class Built:
@@ -130,25 +129,6 @@ def enable_current_thread():
     _TLS.allowed = True
 
 
-def set_export_mode(on=True):
-    """Patch 36: this thread is an export thread. Its GL chains always run on the GPU (no timing against the CPU: an export is not
-    time-critical per frame and the GPU is the faster one for the whole job), and the engine is closed by close_thread()."""
-    _TLS.export = bool(on)
-
-
-def is_export():
-    return bool(getattr(_TLS, "export", False))
-
-
-def close_thread():
-    """Release this thread's GL context (the export thread calls it when it is done)."""
-    eng = getattr(_TLS, "engine", None)
-    _TLS.engine = None; _TLS.tried = False; _TLS.allowed = False; _TLS.export = False
-    if eng is not None:
-        try: eng.close()
-        except Exception: pass
-
-
 def active():
     """True when GL effects may be used on this thread right now."""
     if moderngl is None or _ST["disabled"] or not getattr(_TLS, "allowed", False) or not enabled_by_user():
@@ -187,10 +167,10 @@ def _start_engine():
 
 # ───────────────────────── the engine (one per render thread) ─────────────────────────
 class _Tex:
-    __slots__ = ("tex", "fbo", "w", "h", "c", "dt")
+    __slots__ = ("tex", "fbo", "w", "h", "c")
 
-    def __init__(self, tex, w, h, c, dt="f1"):
-        self.tex = tex; self.fbo = None; self.w = w; self.h = h; self.c = c; self.dt = dt
+    def __init__(self, tex, w, h, c):
+        self.tex = tex; self.fbo = None; self.w = w; self.h = h; self.c = c
 
     def release(self):
         try:
@@ -233,17 +213,17 @@ class _Engine:
         return ent
 
     # -- textures
-    def tex(self, w, h, c=4, dt="f1"):
-        w = max(1, int(w)); h = max(1, int(h)); lst = self.pool.get((w, h, c, dt))
+    def tex(self, w, h, c=4):
+        w = max(1, int(w)); h = max(1, int(h)); lst = self.pool.get((w, h, c))
         if lst:
             self.n_pool -= 1; return lst.pop()
-        t = self.ctx.texture((w, h), c, alignment=1, dtype=dt)
+        t = self.ctx.texture((w, h), c, alignment=1)
         t.filter = (moderngl.LINEAR, moderngl.LINEAR); t.repeat_x = False; t.repeat_y = False
-        return _Tex(t, w, h, c, dt)
+        return _Tex(t, w, h, c)
 
     def free(self, t):
         if t is None: return
-        self.pool.setdefault((t.w, t.h, t.c, t.dt), []).append(t); self.n_pool += 1
+        self.pool.setdefault((t.w, t.h, t.c), []).append(t); self.n_pool += 1
         if self.n_pool > self.POOL_MAX:                 # sizes change (resize of the preview): drop the oldest unused
             for key in list(self.pool):
                 lst = self.pool[key]
@@ -281,7 +261,7 @@ class _Engine:
             targets = {"in": main, "main": main}; mine = []
             for P in passes:
                 ow, oh = P.size if P.size else (w, h)
-                o = self.tex(ow, oh, 4, P.dt); mine.append(o)          # a fresh target every pass: never read and written at once
+                o = self.tex(ow, oh, 4); mine.append(o)          # a fresh target every pass: never read and written at once
                 self.draw(P, targets, o)
                 targets[P.out] = o
             main = targets["main"]

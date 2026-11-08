@@ -119,7 +119,7 @@ class PlaybackMixin:
         if fast_now: q = min(q, 0.25)
         if w is None:
             w = RenderWorker(self.renderer); w.ready.connect(self._on_frame, Qt.QueuedConnection); w.start()
-            QApplication.instance().aboutToQuit.connect(lambda w=w: w.stop(10000)); self._rworker = w
+            QApplication.instance().aboutToQuit.connect(w.stop); self._rworker = w
         self.renderer.live_play = bool(self.playing or fast_now)       # Patch 40: effects may use fewer pixels while it moves
         w.submit(self.proj, self.t, q, fast_now or self.settings["preview_interp"] == "fast")
     def _on_frame(self, img):

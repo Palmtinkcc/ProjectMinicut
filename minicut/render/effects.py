@@ -245,7 +245,7 @@ def _gl_run(c, fx, i, img, k, lt, fast, bg, lane, inner=None):
     if plan is None: return None
     n = plan.n; end = idx[n - 1] + 1; h, w = img.shape[:2]
     key = (tuple(t for t, _ in items[:n]), (w * h) >> 15)
-    pick = "gl" if _GLX.is_export() else _GLX.CHOOSER.pick(key); t0 = _GLX.now_ms()
+    pick = _GLX.CHOOSER.pick(key); t0 = _GLX.now_ms()
     if pick == "gl":
         try: out = _GLX.execute(img, plan)
         except Exception as ex: _GLX.fail("drawing failed: %s" % (ex,)); return None

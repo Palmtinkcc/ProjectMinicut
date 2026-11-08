@@ -8,7 +8,7 @@ from .audio import *
 from .renderer import *
 from ..shared.hwaccel import *
 from ..shared.tasks import TASKS
-import functools, queue, threading
+import functools
 
 
 def letterbox(fr, ow, oh):
@@ -114,43 +114,22 @@ class ExportWorker(QThread):
             if fmt != "png":
                 ef = open(errlog, "wb")      # the encoder's messages go to a file: a full pipe can never block it
                 proc = self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef, creationflags=NOWIN)
-            try:                                    # Patch 36: OpenGL effects also work on the export thread (a real GPU only; software GL stays off)
-                from . import glfx as _glx; _glx.enable_current_thread(); _glx.set_export_mode(True)
-            except Exception: pass
             renderer = Renderer(MediaPool()); total = max(1, int(dur * fps))
             if self._task is not None: self._task.total = total
-            # Patch 36: the frame is written to the encoder by a second thread, so rendering frame i+1 overlaps writing frame i
-            # (before, the render waited for every write). A small queue keeps the memory low.
-            wq = queue.Queue(maxsize=4); werr = []
-            def _writer():
-                while True:
-                    item = wq.get()
-                    if item is None: return
-                    if werr: continue                                  # an error happened: only drain the queue so the render never blocks
-                    kind, i, data = item
-                    try:
-                        if kind == "png":
-                            if not cv2.imwrite(data[0], data[1]): raise RuntimeError("Could not write PNG frame")
-                            frames.append(data[0])
-                        elif proc and proc.stdin: proc.stdin.write(data)
-                    except (BrokenPipeError, OSError) as ex:
-                        if not self.cancel: werr.append(ex)
-                        else: werr.append(None)
-                    except Exception as ex: werr.append(ex)
-            wt = threading.Thread(target=_writer, daemon=True, name="export-writer"); wt.start()
-            try:
-                for i in range(total):
-                    if self.cancel or werr: break
-                    fr = renderer.render(proj, i / fps, 1.0, fast=False)
-                    if ow != proj.w or oh != proj.h: fr = letterbox(fr, ow, oh)
-                    if fmt == "png": wq.put(("png", i, (os.path.join(out, f"frame_{i:06d}.png"), fr)))
-                    elif proc and proc.stdin: wq.put(("raw", i, np.ascontiguousarray(fr).tobytes()))
-                    if i % 3 == 0:
-                        self.progress.emit((i + 1) / total * 100)
-                        if self._task is not None: self._task.done = i + 1
-            finally:
-                wq.put(None); wt.join()
-            if werr and werr[0] is not None and not self.cancel: raise RuntimeError(str(werr[0]))
+            for i in range(total):
+                if self.cancel: break
+                fr = renderer.render(proj, i / fps, 1.0, fast=False)
+                if ow != proj.w or oh != proj.h: fr = letterbox(fr, ow, oh)
+                if fmt == "png":
+                    fn = os.path.join(out, f"frame_{i:06d}.png")
+                    if not cv2.imwrite(fn, fr): raise RuntimeError("Could not write PNG frame")
+                    frames.append(fn)
+                elif proc and proc.stdin:
+                    try: proc.stdin.write(np.ascontiguousarray(fr).tobytes())
+                    except (BrokenPipeError, OSError): break
+                if i % 3 == 0:
+                    self.progress.emit((i + 1) / total * 100)
+                    if self._task is not None: self._task.done = i + 1
             if proc:
                 if self.cancel:
                     try: proc.kill()
@@ -170,9 +149,6 @@ class ExportWorker(QThread):
             return False, str(ex)
         finally:
             self._proc = None
-            try:
-                from . import glfx as _glx; _glx.close_thread()
-            except Exception: pass
             if tmpd:
                 import shutil; shutil.rmtree(tmpd, ignore_errors=True)
 
