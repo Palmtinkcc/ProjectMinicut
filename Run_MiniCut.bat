@@ -7,12 +7,12 @@ if not exist .venv\Scripts\python.exe (
 )
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r minicut\requirements.txt
 if errorlevel 1 (
   echo.
   echo Install failed. Check the messages above.
   pause
   exit /b 1
 )
-python file.py
+python minicut\file.py
 if errorlevel 1 pause

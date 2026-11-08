@@ -204,9 +204,9 @@ import bisect, heapq, math, re, shutil, threading, time, subprocess
 
 def _proxy_cmd(path, d, enc):
     h = int(CFG.get("proxy_height", PROXY_HEIGHT)); crf = int(CFG.get("proxy_quality", 23))
-    cmd = [FFMPEG, "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", path, "-an", "-vf", "scale=-2:min(%d\\,ih)" % h]
+    cmd = [FFMPEG, "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-hwaccel", "auto", "-i", path, "-an", "-vf", "scale=-2:min(%d\\,ih):flags=fast_bilinear" % h]      # Patch 36: GPU decoding when there is one (software otherwise), cheaper scaling
     if enc is None:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-threads", str(int(CFG.get("bg_threads", max(1, (os.cpu_count() or 4) // 2))))]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf), "-threads", str(int(CFG.get("proxy_threads", max(1, os.cpu_count() or 4))))]       # Patch 36: ultrafast (every frame is a keyframe anyway) and every core (the process runs at below-normal priority)
     else:
         # Settings widely supported across driver versions (no "usage=ultralowlatency": some AMF drivers reject it
         # together with "-quality speed" and fail with "Invalid argument"). No B-frames, since every frame is a keyframe.

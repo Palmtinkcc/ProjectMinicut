@@ -118,6 +118,9 @@ class MainWindow(AutosaveMixin, MediaPreviewMixin, RecordMixin, ProjectMixin, Wo
 
 
 def main():
+    try:
+        from . import crashlog; crashlog.install_qt()          # Patch 36: Qt's warnings / fatal messages also go to ~/.minicut/crash.log
+    except Exception: pass
     app=QApplication(sys.argv); app.setApplicationName('MiniCut'); app.setStyle('Fusion'); app.setStyleSheet(QSS)
     win=MainWindow(); apply_ui(win); win.restore_layout(); install_progress(win); install_gpu_surface()
     # apply_perf applies the saved compositing mode using the Settings mapping API.

@@ -492,9 +492,206 @@ def b_find_edges(p, c, w, h, opaque):
     return Built(passes)
 
 
+# ───────────────────────── Better Chroma Key (Patch 36) ─────────────────────────
+# Same steps and constants as smartkey.fx_smart_key (matte from the chroma distance, despill, choke / feather, edge colour) as GPU passes.
+# Targets: col = the colour, A = the matte (grey), inner / z0 / cn / cd = the edge-colour helpers.
+_SK_OBJ = _fs("void main() { float a = texture(u_in, v_uv).a; o = vec4(a, a, a, 1.0); }")
+_SK_COL = _fs("""uniform vec3 u_dom, u_oth; uniform float u_cnt, u_amt;
+void main() { vec3 x = texture(u_in, v_uv).rgb;
+  if (u_amt > 0.0 && u_cnt > 0.0) { float lim = dot(x, u_oth) / u_cnt; x = mix(x, min(x, vec3(lim)), u_dom * u_amt); }
+  o = vec4(x, 1.0); }""")
+_SK_A = _fs("""uniform vec2 u_kc; uniform float u_t0, u_wd;
+void main() { vec4 c = texture(u_in, v_uv); float R = floor(c.b * 255.0 + 0.5), G = floor(c.g * 255.0 + 0.5), B = floor(c.r * 255.0 + 0.5);
+  float Y = floor(0.299 * R + 0.587 * G + 0.114 * B + 0.5);                       // the 8-bit YCrCb of the CPU version (Y is rounded first)
+  float cr = clamp(floor((R - Y) * 0.713 + 128.5), 0.0, 255.0), cb = clamp(floor((B - Y) * 0.564 + 128.5), 0.0, 255.0);
+  float d = length(vec2(cr - u_kc.x, cb - u_kc.y)); float t = clamp((d - u_t0) / u_wd, 0.0, 1.0);
+  float a = t * t * (3.0 - 2.0 * t) * c.a; o = vec4(a, a, a, 1.0); }""")
+_SK_MORPH = _fs("""uniform int u_n; uniform int u_grow; uniform vec2 u_in_sz;
+void main() { float m = u_grow == 1 ? 0.0 : 1.0; int n2 = u_n * u_n;
+  for (int j = -u_n; j <= u_n; j++) { int hw = int(floor(sqrt(float(n2 - j * j)) + 0.5));          // the same round ellipse as OpenCV's getStructuringElement
+    for (int i = -hw; i <= hw; i++) {
+      float a = texture(u_in, v_uv + vec2(float(i), float(j)) / u_in_sz).r; m = u_grow == 1 ? max(m, a) : min(m, a); } }
+  o = vec4(m, m, m, 1.0); }""")
+_SK_INNER = _fs("""uniform int u_n; uniform vec2 u_in_sz;
+void main() { float m = 1.0; int n2 = u_n * u_n;
+  for (int j = -u_n; j <= u_n; j++) { int hw = int(floor(sqrt(float(n2 - j * j)) + 0.5));
+    for (int i = -hw; i <= hw; i++) {
+      float a = texture(u_in, v_uv + vec2(float(i), float(j)) / u_in_sz).r; m = min(m, a > 0.97 ? 1.0 : 0.0); } }
+  o = vec4(m, m, m, 1.0); }""")
+_SK_ZONE = _fs("""uniform sampler2D u_inner;
+void main() { float a = texture(u_in, v_uv).r; float solid = a > 0.97 ? 1.0 : 0.0; float ring = solid - texture(u_inner, v_uv).r;
+  float partial = (a > 0.004 && a <= 0.97) ? 1.0 : 0.0; float z = max(ring, partial); o = vec4(z, z, z, 1.0); }""")
+_SK_CN = _fs("""uniform sampler2D u_col, u_inner;
+void main() { float k = texture(u_inner, v_uv).r; o = vec4(texture(u_col, v_uv).rgb * k, 1.0); }""")
+_SK_FIN = _fs("""uniform sampler2D u_col, u_A, u_z, u_cn, u_cd; uniform float u_amt; uniform vec3 u_ecol; uniform int u_mode, u_view;
+void main() {
+  vec3 col = texture(u_col, v_uv).rgb; float A = texture(u_A, v_uv).r;
+  float z = (u_mode > 0 || u_view == 2) ? clamp(texture(u_z, v_uv).r * 1.6, 0.0, 1.0) : 0.0;
+  if (u_view == 1) { o = vec4(vec3(A), 1.0); return; }
+  if (u_view == 2) { o = vec4(vec3(z), 1.0); return; }
+  if (u_mode == 2) col = mix(col, u_ecol, z * u_amt);
+  else if (u_mode == 1) { float den = texture(u_cd, v_uv).r; vec3 ec = den > 1e-3 ? texture(u_cn, v_uv).rgb / max(den, 1e-3) : col; col = mix(col, ec, z * u_amt); }
+  o = vec4(clamp(col, 0.0, 1.0), A); }""")
+
+
+def _sk_bgr(s):
+    s = str(s or "#00ff00").lstrip("#")
+    if len(s) == 8: s = s[2:]
+    try: return (int(s[4:6], 16), int(s[2:4], 16), int(s[0:2], 16))
+    except Exception: return (0, 255, 0)
+
+
+def _blur_to(passes, src, w, h, sigma, prefix, dt="f1"):
+    """Gaussian blur of target `src` (grey or colour); returns the name of the result target. dt="f2": 16-bit float targets."""
+    if sigma < 0.3: return src
+    ps, cur, _ = gauss_chain(w, h, sigma, sigma, src=src, prefix=prefix)
+    for q in ps: q.dt = dt
+    passes.extend(ps)
+    return cur
+
+
+def b_smart_key(p, c, w, h, opaque):
+    mode = p.get("mode", "color"); view = p.get("view", "result"); k = max(1e-3, float(c.k)); passes = []
+    if mode == "object":
+        if opaque: return Built([])                                    # nothing rendered (yet): the picture is left alone (as on the CPU)
+        passes.append(Pass(_SK_OBJ, {}, {"u_in": "in"}, "A")); colsrc = "in"
+    else:
+        kb = _sk_bgr(p["color"]); kd = [v / 255.0 for v in kb]; mx = max(kd); amt = float(p.get("spill", 60.0)) / 100.0
+        dom = [1.0 if kd[i] >= 0.7 * mx else 0.0 for i in range(3)]; oth = [1.0 - d for d in dom]; cnt = sum(oth)
+        if amt <= 0 or mx < 0.12 or cnt == 0: amt = 0.0
+        R, G, B = kb[2], kb[1], kb[0]; Y = math.floor(0.299 * R + 0.587 * G + 0.114 * B + 0.5)
+        kc = (float(min(255, max(0, math.floor((R - Y) * 0.713 + 128.5)))), float(min(255, max(0, math.floor((B - Y) * 0.564 + 128.5)))))
+        t0 = float(p["tolerance"]) * 1.1 + 1.5; wd = 1.5 + float(p["softness"]) * 1.1
+        passes.append(Pass(_SK_COL, {"u_dom": tuple(dom), "u_oth": tuple(oth), "u_cnt": cnt, "u_amt": amt}, {"u_in": "in"}, "col"))
+        passes.append(Pass(_SK_A, {"u_kc": kc, "u_t0": t0, "u_wd": wd}, {"u_in": "in"}, "A"))
+        colsrc = "col"
+    A = "A"
+    r = float(p.get("choke", 0.0)) * k
+    if abs(r) >= 0.5:
+        n = int(round(abs(r)))
+        if n > 12: return None                                         # a very big choke: the CPU does it
+        passes.append(Pass(_SK_MORPH, {"u_n": n, "u_grow": 0 if r > 0 else 1}, {"u_in": A}, "A1")); A = "A1"
+    f = float(p.get("feather", 0.0)) * k
+    if f > 0.3: A = _blur_to(passes, A, w, h, f * 0.5, "kf")
+    emode = p.get("edge_mode", "auto"); eamt = float(p.get("edge_amount", 70.0)) / 100.0; wpx = float(p.get("edge_width", 3.0)) * k
+    edge_on = not (emode == "off" or eamt <= 0 or wpx <= 0.0)
+    zname = A; cn = A; cd = A
+    if edge_on or view == "edge":
+        wz = wpx if edge_on else max(1.0, float(p.get("edge_width", 3.0)) * k); n = max(1, int(round(wz)))
+        if n > 12: return None
+        passes.append(Pass(_SK_INNER, {"u_n": n}, {"u_in": A}, "inner"))
+        passes.append(Pass(_SK_ZONE, {}, {"u_in": A, "u_inner": "inner"}, "z0"))
+        zname = _blur_to(passes, "z0", w, h, max(0.7, wz * 0.35), "kz")
+        if edge_on and emode != "custom":
+            sig = max(3.0, wz * 2.0 + 3.0)
+            passes.append(Pass(_SK_CN, {}, {"u_col": colsrc, "u_inner": "inner"}, "cn0", dt="f2"))
+            cn = _blur_to(passes, "cn0", w, h, sig, "kn", "f2"); cd = _blur_to(passes, "inner", w, h, sig, "kd", "f2")
+    ec = tuple(v / 255.0 for v in _sk_bgr(p.get("edge_color", "#303030")))
+    passes.append(Pass(_SK_FIN, {"u_amt": eamt, "u_ecol": ec, "u_mode": (0 if not edge_on else (2 if emode == "custom" else 1)),
+                                 "u_view": {"result": 0, "matte": 1, "edge": 2}.get(view, 0)},
+                       {"u_col": colsrc, "u_A": A, "u_z": zname, "u_cn": cn, "u_cd": cd}, "main"))
+    return Built(passes, alpha=True)
+
+
+
+# ───────────────────────── more effects (Patch 36) ─────────────────────────
+# Every one of these was compared with its CPU version on a test picture (see the Patch 36 notes); where a parameter combination is not done
+# here the builder returns None and the CPU runs it.
+_SAMP = """uniform vec2 u_in_sz;
+int pmod(int a, int b) { return a - b * int(floor(float(a) / float(b))); }                                        // never negative (the % operator on a negative number differs between drivers)
+int rfl(int i, int n) { int m = pmod(i, 2 * n); return m >= n ? 2 * n - 1 - m : m; }          // BORDER_REFLECT
+int rfl101(int i, int n) { if (n < 2) return 0; int P = 2 * (n - 1); int m = pmod(i, P); return m >= n ? P - m : m; }   // BORDER_REFLECT_101
+vec4 fetch(ivec2 i) { ivec2 n = ivec2(u_in_sz); return texelFetch(u_in, ivec2(rfl(i.x, n.x), rfl(i.y, n.y)), 0); }
+vec4 bil(vec2 s) { vec2 f = floor(s); vec2 t = s - f; ivec2 i = ivec2(f);                                           // cv2.remap INTER_LINEAR, pixel index coordinates
+  return mix(mix(fetch(i), fetch(i + ivec2(1, 0)), t.x), mix(fetch(i + ivec2(0, 1)), fetch(i + ivec2(1, 1)), t.x), t.y); }
+"""
+
+_EXPO = _fs("""uniform float u_ev, u_off, u_ig;
+void main() { vec4 c = texture(u_in, v_uv); vec3 f = clamp(c.rgb * u_ev + u_off, 0.0, 8.0); o = vec4(clamp(pow(f, vec3(u_ig)), 0.0, 1.0), c.a); }""")
+
+
+def b_exposure(p, c, w, h, opaque):
+    return Built([Pass(_EXPO, {"u_ev": 2.0 ** float(p["exposure"]), "u_off": float(p["offset"]) / 100.0, "u_ig": 1.0 / max(0.05, float(p["gamma"]))})])
+
+
+_FLIP = _fs(_SAMP + """uniform ivec2 u_f;
+void main() { ivec2 p = ivec2(gl_FragCoord.xy); ivec2 n = ivec2(u_in_sz); if (u_f.x == 1) p.x = n.x - 1 - p.x; if (u_f.y == 1) p.y = n.y - 1 - p.y; o = texelFetch(u_in, p, 0); }""")
+
+
+def b_flip_layer(p, c, w, h, opaque):
+    ax = p.get("axis", "horizontal")
+    f = (1, 0) if ax == "horizontal" else ((0, 1) if ax == "vertical" else (1, 1))
+    return Built([Pass(_FLIP, {"u_f": f})])
+
+
+_MIRROR = _fs(_SAMP + """uniform int u_mode; uniform vec2 u_c;
+void main() { vec2 xy = floor(gl_FragCoord.xy); vec2 s = xy;
+  if (u_mode == 0 || u_mode == 4) s.x = xy.x > u_c.x ? 2.0 * u_c.x - xy.x : xy.x;
+  if (u_mode == 1) s.x = xy.x < u_c.x ? 2.0 * u_c.x - xy.x : xy.x;
+  if (u_mode == 2 || u_mode == 4) s.y = xy.y > u_c.y ? 2.0 * u_c.y - xy.y : xy.y;
+  if (u_mode == 3) s.y = xy.y < u_c.y ? 2.0 * u_c.y - xy.y : xy.y;
+  o = bil(s); }""")
+
+
+def b_mirror(p, c, w, h, opaque):
+    m = {"lr": 0, "rl": 1, "tb": 2, "bt": 3, "quad": 4}.get(p["mode"])
+    if m is None: return None                                        # kaleidoscope: the CPU does it
+    return Built([Pass(_MIRROR, {"u_mode": m, "u_c": (w * float(p["cx"]) / 100.0, h * float(p["cy"]) / 100.0)})])
+
+
+_BOXH = _fs("""uniform ivec2 u_dir; uniform int u_r; uniform vec2 u_in_sz;
+void main() { ivec2 p = ivec2(gl_FragCoord.xy); ivec2 n = ivec2(u_in_sz); vec4 acc = vec4(0.0);
+  for (int i = -u_r; i <= u_r; i++) acc += texelFetch(u_in, clamp(p + u_dir * i, ivec2(0), n - 1), 0);
+  o = acc / float(2 * u_r + 1); }""")
+
+
+def b_boxblur(p, c, w, h, opaque):
+    if not opaque: return None                                       # see-through edges need premultiplied pixels: the CPU function does that
+    r = int(max(1, p["size"] * c.k)); n = int(p["passes"])
+    if r > 100 or n < 1: return None if r > 100 else Built([])
+    ps = []; cur = "in"
+    for i in range(n):
+        ps.append(Pass(_BOXH, {"u_dir": (1, 0), "u_r": r}, {"u_in": cur}, "bx%da" % i, dt="f2")); cur = "bx%da" % i
+        ps.append(Pass(_BOXH, {"u_dir": (0, 1), "u_r": r}, {"u_in": cur}, "bx%db" % i, dt="f2" if i < n - 1 else "f1")); cur = "bx%db" % i
+    ps[-1].out = "main"
+    return Built(ps)
+
+
+_CHROMA_AB = _fs(_SAMP + """uniform float u_k; uniform vec2 u_o;
+void main() { vec2 xy = floor(gl_FragCoord.xy); vec2 cen = u_in_sz * 0.5; vec4 c = texelFetch(u_in, ivec2(xy), 0);
+  float rr = bil(cen + (xy - cen) * (1.0 - u_k) + u_o).b;            // R (index 2) is the b component
+  float bb = bil(cen + (xy - cen) * (1.0 + u_k) - u_o).r;            // B (index 0)
+  o = vec4(bb, c.g, rr, c.a); }""")
+
+
+def b_chromab(p, c, w, h, opaque):
+    a = math.radians(float(p["angle"])); sh = float(p["shift"]) * c.k
+    return Built([Pass(_CHROMA_AB, {"u_k": float(p["amount"]) / 1000.0, "u_o": (math.cos(a) * sh, math.sin(a) * sh)})])
+
+
+_EMBOSS = _fs("""uniform mat3 u_kern; uniform float u_mix; uniform int u_color; uniform vec2 u_in_sz;
+int r101(int i, int n) { if (n < 2) return 0; int P = 2 * (n - 1); int m = i - P * int(floor(float(i) / float(P))); return m >= n ? P - m : m; }
+float L(ivec2 p) { ivec2 n = ivec2(u_in_sz); return lum(texelFetch(u_in, ivec2(r101(p.x, n.x), r101(p.y, n.y)), 0).rgb); }
+void main() { ivec2 p = ivec2(gl_FragCoord.xy); vec4 c = texture(u_in, v_uv); float g = 0.0;
+  for (int j = 0; j < 3; j++) for (int i = 0; i < 3; i++) g += u_kern[i][j] * L(p + ivec2(i - 1, j - 1));     // u_kern[col i][row j]
+  float rel = clamp(0.5 + g * 0.5, 0.0, 1.0);
+  vec3 e = u_color == 0 ? vec3(rel) : c.rgb * rel * 2.0; o = vec4(clamp(c.rgb * (1.0 - u_mix) + e * u_mix, 0.0, 1.0), c.a); }""")
+
+
+def b_emboss(p, c, w, h, opaque):
+    if c.k > 1.5: return None                                        # the CPU smooths the picture first at this scale
+    a = math.radians(float(p["angle"])); sa, ca = math.sin(a), math.cos(a); d = float(p["depth"]) / 30.0
+    rows = [[-sa - ca, -sa, ca - sa], [-ca, 1.0, ca], [sa - ca, sa, sa + ca]]
+    # GLSL mat3 is column-major: u_kern[i][j] = rows[j][i]
+    flat = [rows[j][i] * d for i in range(3) for j in range(3)]
+    return Built([Pass(_EMBOSS, {"u_kern": tuple(flat), "u_mix": float(p["mix"]) / 100.0, "u_color": 1 if p["color"] else 0})])
+
+
+
 GL_FX = {"tint": b_tint, "bw": b_bw, "invert": b_invert, "adjust": b_adjust, "hue_shift": b_hue_shift,
          "color_temperature": b_color_temperature, "highlights_shadows": b_highlights_shadows, "posterize": b_posterize,
          "threshold": b_threshold, "gradient_map": b_gradient_map, "luma_key": b_luma_key, "chroma": b_chroma,
          "blur": b_blur, "motion_blur": b_motion_blur, "radial_blur": b_radial_blur, "zoom_blur": b_zoom_blur, "spin_blur": b_spin_blur,
          "rgb_split": b_rgb_split, "pixelate": b_pixelate, "sharpen": b_sharpen, "vignette": b_vignette,
-         "glow": b_glow, "soft_glow": b_soft_glow, "dark_glow": b_dark_glow, "grain": b_grain, "noise": b_noise, "find_edges": b_find_edges}
+         "glow": b_glow, "soft_glow": b_soft_glow, "dark_glow": b_dark_glow, "grain": b_grain, "noise": b_noise, "find_edges": b_find_edges, "smart_key": b_smart_key,
+         "exposure": b_exposure, "flip_layer": b_flip_layer, "mirror": b_mirror, "boxblur": b_boxblur, "chromab": b_chromab, "emboss": b_emboss}
