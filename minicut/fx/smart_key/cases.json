@@ -1,0 +1,32 @@
+{
+ "cases": [
+  {},
+  {
+   "tolerance": 50,
+   "softness": 30
+  },
+  {
+   "edge_mode": "off"
+  },
+  {
+   "edge_mode": "custom",
+   "edge_color": "#ff0000"
+  },
+  {
+   "choke": 2,
+   "feather": 3
+  },
+  {
+   "view": "matte"
+  },
+  {
+   "view": "edge"
+  },
+  {
+   "spill": 0
+  },
+  {
+   "color": "#0000ff"
+  }
+ ]
+}

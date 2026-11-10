@@ -57,6 +57,11 @@ def _code_hash():
         pack = os.path.join(here, "fxpack")
         try: files += [os.path.join(pack, n) for n in sorted(os.listdir(pack)) if n.endswith(".py")]
         except OSError: pass
+        try:                                                        # Patch 36: the effects live in minicut/fx/ now
+            fxdir = os.path.join(os.path.dirname(here), "fx")
+            for d, _, fs in sorted(os.walk(fxdir)):
+                files += [os.path.join(d, n) for n in sorted(fs) if n.endswith((".py", ".frag", ".glsl", ".txt", ".json")) and "__pycache__" not in d]
+        except OSError: pass
         h = hashlib.sha1()
         for f in files:
             try:

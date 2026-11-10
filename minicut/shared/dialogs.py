@@ -64,7 +64,8 @@ class SettingsDialog(AnimatedDialog):
         gb = QPushButton("Check GPU encoders"); gb.clicked.connect(self.check_gpu)
         self.gpu_lbl = QLabel("Not checked yet."); self.gpu_lbl.setObjectName("Dim"); self.gpu_lbl.setWordWrap(True)
         self.gpu_box = QComboBox()
-        for lab, val in (("Auto (GPU when self-test passes)", "auto"), ("CPU only", "off"), ("Always GPU", "on")): self.gpu_box.addItem(lab, val)
+        for lab, val in (("Auto (the program tests and chooses)", "auto"), ("OpenCV (CPU): forced", "off"), ("OpenGL (GPU): forced", "on")): self.gpu_box.addItem(lab, val)
+        self.gpu_box.setToolTip("Which API draws the effects and composes the frames (preview and export). The interface is not affected.\nAuto: OpenGL where the self-test passes and it is faster, OpenCV otherwise.\nOpenGL forced: every effect that has an OpenGL version uses it (no timing, an old failure note is ignored); the rest still run on the CPU.\nOpenCV forced: no OpenGL at all for effects and composing.")
         self.gpu_box.setCurrentIndex(max(0, self.gpu_box.findData(s["gpu_compose"])))
         gpu_btn = QPushButton("Test GPU"); gpu_btn.clicked.connect(self.test_gpu)
         self.thr_box = QComboBox(); self.thr_box.addItem("Auto (leave 2 free)", 0)
@@ -75,11 +76,10 @@ class SettingsDialog(AnimatedDialog):
         self.ram_box.setCurrentIndex(max(0, self.ram_box.findData(int(s["preview_ram_mb"]))))
         self.prio_cb = QCheckBox("Keep render thread below window priority"); self.prio_cb.setChecked(bool(s["low_priority"]))
         row(f3, "", self.hwdec); row(f3, "", self.showfps); row(f3, "", self.bake_cb); row(f3, "", self.bake_gb); row(f3, "", self.bake_clear); row(f3, "", self.fxadapt); row(f3, "Export encoder", self.enc); row(f3, "", gb); row(f3, "GPU info", self.gpu_lbl)
-        row(f3, "Compositing", self.gpu_box); row(f3, "", gpu_btn)
+        row(f3, "Render API", self.gpu_box); row(f3, "", gpu_btn)
         row(f3, "Render threads", self.thr_box); row(f3, "RAM cache", self.ram_box); row(f3, "", self.prio_cb)
         try:
-            from ..render.gpu import GPU
-            self.gpu_lbl.setText(GPU.status)
+            self.gpu_lbl.setText(self._api_status())
         except Exception: pass
         vl.addWidget(c3)
 
@@ -199,15 +199,19 @@ class SettingsDialog(AnimatedDialog):
         mode = self.gpu_box.currentData()
         GPU.set_mode(mode)
         if mode == "off":
-            self.gpu_lbl.setText("off (CPU only) — GPU compositing is disabled by selection.")
+            self.gpu_lbl.setText("OpenCV (CPU) is forced: no OpenGL is used for effects or composing. The interface is not affected.")
             self.app.request_render()
             return
         GPU.retry(); self.gpu_lbl.setText("Testing ...")
         self.app.request_render(); self._poll_gpu(8)
     def _poll_gpu(self, n):
         from ..render.gpu import GPU
-        self.gpu_lbl.setText(GPU.status)
+        self.gpu_lbl.setText(self._api_status())
         if n > 0 and GPU.status.startswith("testing"): QTimer.singleShot(600, lambda: self._poll_gpu(n - 1))
+    def _api_status(self):
+        from ..render.gpu import GPU
+        from ..render import glfx
+        return "Composing: %s\nEffects (OpenGL): %s" % (GPU.status, glfx.status())
     def check_gpu(self):
         self.gpu_lbl.setText("Testing ..."); QApplication.processEvents()
         from ..render.media import reset_bad_hw; reset_bad_hw()      # give the GPU proxy encoder another chance too

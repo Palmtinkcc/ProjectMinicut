@@ -1,9 +1,12 @@
-"""The effect pack: about 150 more effects in the groups Color, Opacity, Glitch, VHS, Background, Repeat, Particle, 3D object,
-Wipes & shatter, Shake & transform, Strokes & shadows, Distortion & warp, Procedural, Move, Blur, Lens, Water & glass, Ink & paint.
-Every module registers its effects when it is imported; a module that fails never stops the others (or the program)."""
-import importlib, traceback
+"""The effect pack. Since Patch 36 every effect is a folder in minicut/fx/ (see fx/README.md); this package only starts the loader so that the
+effects are registered when render/effects.py has finished (the name stays: effects.py imports it).
+A folder that fails never stops the others (or the program)."""
+import traceback
 
-for _m in ("color", "glitch", "vhs", "background", "repeat", "particle", "wipes", "strokes", "warp", "motion"):
-    try: importlib.import_module("." + _m, __name__)
-    except Exception:
-        print("[effects] pack module", _m, "could not be loaded"); traceback.print_exc()
+try:
+    from ...fx import loader
+    loader.load_all()
+    from ..effects import FX
+    loader.reorder(FX)
+except Exception:
+    print("[effects] the effect folders could not be loaded"); traceback.print_exc()

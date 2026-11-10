@@ -10,6 +10,8 @@ How to add an effect
        It returns a list of Pass objects (see glfx.py) wrapped in Built(passes, alpha=<writes the alpha plane>), or None when this
        combination of parameters is not handled (the CPU function then runs, so nothing is ever lost).
     2. Add it to GL_FX = {"effect type": builder}.
+  NEW effects do not go here: each one gets its own folder  minicut/fx/<effect id>/  (effect.py, *.frag, cases.json). See minicut/fx/README.md.
+  This file keeps the first 27 effects and gauss_chain; fx/loader.py adds the folder effects to GL_FX (load_fx() at the end).
 That is all: the engine uploads the picture once, runs the passes of every effect in the run, and reads the result back once.
 
 Conventions
@@ -498,3 +500,9 @@ GL_FX = {"tint": b_tint, "bw": b_bw, "invert": b_invert, "adjust": b_adjust, "hu
          "blur": b_blur, "motion_blur": b_motion_blur, "radial_blur": b_radial_blur, "zoom_blur": b_zoom_blur, "spin_blur": b_spin_blur,
          "rgb_split": b_rgb_split, "pixelate": b_pixelate, "sharpen": b_sharpen, "vignette": b_vignette,
          "glow": b_glow, "soft_glow": b_soft_glow, "dark_glow": b_dark_glow, "grain": b_grain, "noise": b_noise, "find_edges": b_find_edges}
+
+
+def load_fx():
+    """The effects that live in their own folders (minicut/fx/<id>/) are added to GL_FX here, once. The engine calls this before it looks."""
+    from ..fx import loader
+    loader.load_all(GL_FX)

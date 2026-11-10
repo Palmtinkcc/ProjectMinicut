@@ -615,6 +615,9 @@ class GpuState:
         if mode != self.mode:
             old_mode = self.mode
             self.mode = mode
+            try:
+                from . import glfx; glfx.settings_changed()          # Patch 36: the GL effect engine follows the new setting at once
+            except Exception: pass
             if mode != "off":
                 self.reset_requested = True
             else:

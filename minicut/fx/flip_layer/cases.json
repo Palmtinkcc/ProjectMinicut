@@ -1,0 +1,13 @@
+{
+ "cases": [
+  {
+   "axis": "horizontal"
+  },
+  {
+   "axis": "vertical"
+  },
+  {
+   "axis": "both"
+  }
+ ]
+}
