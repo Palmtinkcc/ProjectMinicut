@@ -8,6 +8,7 @@ from .audio import *
 from .renderer import *
 from ..shared.hwaccel import *
 from ..shared.tasks import TASKS
+from ..shared.optimize import X264_PRESET, SVT_PRESET, AOM_CPU_USED, export_crf
 import functools, queue, threading
 
 
@@ -98,16 +99,16 @@ class ExportWorker(QThread):
                 cmd = [FFMPEG, "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{ow}x{oh}", "-r", str(fps), "-i", "-"]
                 has_audio = os.path.getsize(wav) > 44
                 if has_audio: cmd += ["-i", wav]
-                vcodec, hwenc, _note = codec_plan(fmt)
+                vcodec, hwenc, _note = codec_plan(fmt); _xp = CFG.get("export_preset", "fast")       # Settings > Export > Preset
                 if vcodec is None: raise RuntimeError(_note)
                 self._detail(_note)
                 cmd += ["-c:v", vcodec]
                 if fmt == "mov": cmd += ["-profile:v", "3"]
                 elif fmt == "webm": cmd += ["-b:v", "4M"]
-                elif hwenc: cmd += hw_quality_args(hwenc[0], crf, ow)
-                elif vcodec == "libsvtav1": cmd += ["-crf", str(crf), "-preset", "8", "-pix_fmt", "yuv420p"]
-                elif vcodec == "libaom-av1": cmd += ["-crf", str(crf), "-b:v", "0", "-cpu-used", "6", "-row-mt", "1", "-pix_fmt", "yuv420p"]
-                else: cmd += ["-crf", str(crf), "-preset", "veryfast", "-pix_fmt", "yuv420p"]
+                elif hwenc: cmd += hw_quality_args(hwenc[0], crf, ow, _xp)
+                elif vcodec == "libsvtav1": cmd += ["-crf", str(crf), "-preset", SVT_PRESET.get(_xp, "8"), "-pix_fmt", "yuv420p"]
+                elif vcodec == "libaom-av1": cmd += ["-crf", str(crf), "-b:v", "0", "-cpu-used", AOM_CPU_USED.get(_xp, "6"), "-row-mt", "1", "-pix_fmt", "yuv420p"]
+                else: cmd += ["-crf", str(crf), "-preset", X264_PRESET.get(_xp, "veryfast"), "-pix_fmt", "yuv420p"]
                 if has_audio: cmd += ["-c:a", "libopus" if fmt == "webm" else "aac", "-b:a", "192k", "-shortest"]
                 cmd += ["-movflags", "+faststart"] if fmt in ("mp4", "mp4_265", "mkv", "av1") else []
                 cmd += [out]
@@ -241,7 +242,7 @@ class ExportDialog(AnimatedDialog):
         self.size = QComboBox()
         for label, w, h in SIZE_PRESETS: self.size.addItem(label, (w, h))
         idx = next((i for i, (_, w, h) in enumerate(SIZE_PRESETS) if (w, h) == (app.proj.w, app.proj.h)), 0); self.size.setCurrentIndex(idx)
-        self.crf = QSpinBox(); self.crf.setRange(12, 35); self.crf.setValue(20); self.crf.setToolTip("Lower = better quality, bigger file")
+        self.crf = QSpinBox(); self.crf.setRange(12, 35); self.crf.setValue(export_crf(app.settings["export_space"])); self.crf.setToolTip("Lower = better quality, bigger file")
         for ic, lab, w in (("video", "Format", self.fmt), ("folder_open", "Folder", self.path), ("text", "Name", self.filename),
                            ("aspect_ratio", "Size", self.size), ("speed", "FPS", self.fps), ("tune", "Quality", self.crf)):
             l = QWidget(); ll = QHBoxLayout(l); ll.setContentsMargins(0, 0, 0, 0); ll.setSpacing(6); ll.addWidget(icon_label(ic, "#9aa4b8", 16)); t = QLabel(lab); t.setObjectName("Dim"); ll.addWidget(t); ll.addStretch()

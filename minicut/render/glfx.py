@@ -72,7 +72,7 @@ class Built:
 
 
 # ───────────────────────── state / crash guard ─────────────────────────
-_ST = {"disabled": False, "status": "not started", "tried": False, "epoch": 0, "lock": threading.Lock()}
+_ST = {"disabled": False, "status": "not started", "tried": False, "lock": threading.Lock()}
 _TLS = threading.local()
 
 
@@ -101,23 +101,8 @@ def status():
 def reset():
     """Forget an earlier failure / crash note and allow GL again (called by the Test GPU button)."""
     _write({})
-    settings_changed()
-
-
-def settings_changed():
-    """Patch 36: every thread tries to start the GL engine again (the 'tried and failed' note lives in thread-local data, so before this a retry or
-    a new setting only worked after a restart)."""
     with _ST["lock"]:
-        _ST["disabled"] = False; _ST["tried"] = False; _ST["status"] = "not started"; _ST["epoch"] += 1
-
-
-def forced():
-    """The render API is forced to OpenGL (Settings > Render API): no timing against the CPU, an old 'failed' note is ignored, software OpenGL is accepted."""
-    try:
-        from .gpu import GPU
-        return GPU.mode == "on"
-    except Exception:
-        return False
+        _ST["disabled"] = False; _ST["tried"] = False; _ST["status"] = "not started"
 
 
 def fail(why):
@@ -170,12 +155,7 @@ def active():
         return False
     eng = getattr(_TLS, "engine", None)
     if eng is not None:
-        if _ST["status"] == "not started": _ST["status"] = "active: " + getattr(eng, "name", "OpenGL")
         return True
-    ep = _ST["epoch"]
-    if getattr(_TLS, "epoch", ep) != ep:                 # the setting changed (or Test GPU was pressed) since this thread tried
-        _TLS.tried = False
-    _TLS.epoch = ep
     if getattr(_TLS, "tried", False):
         return False
     _TLS.tried = True
@@ -187,7 +167,7 @@ def _start_engine():
     if st.get("status") == "probing":
         fail("the program stopped while the GL effects were tested last time (Test GPU tries again)")
         return False
-    if st.get("status") == "failed" and not (os.environ.get("MINICUT_GLFX_FORCE") or forced()):
+    if st.get("status") == "failed" and not os.environ.get("MINICUT_GLFX_FORCE"):
         _ST["disabled"] = True; _ST["status"] = "off: %s (Test GPU tries again)" % st.get("reason", "failed before")
         return False
     _write({"status": "probing"})
@@ -235,7 +215,7 @@ class _Engine:
         low = self.name.lower()
         if self.ctx.version_code < 330:
             raise RuntimeError("OpenGL %.1f is too old (3.3 needed)" % (self.ctx.version_code / 100.0))
-        if any(w in low for w in ("gdi generic", "llvmpipe", "software", "swrast", "softpipe")) and not (os.environ.get("MINICUT_GLFX_SOFT") or forced()):
+        if any(w in low for w in ("gdi generic", "llvmpipe", "software", "swrast", "softpipe")) and not os.environ.get("MINICUT_GLFX_SOFT"):
             raise RuntimeError("only software OpenGL is available (%s): the CPU effects are faster" % self.name)
         self.vbo = self.ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32).tobytes())
         self.progs = {}                  # fragment source -> (program, vao)

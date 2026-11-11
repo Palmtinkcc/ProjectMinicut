@@ -1,6 +1,7 @@
 """Audio mixing, streaming playback and the level meter state."""
 from ..shared.deps import *
 from ..shared.core import *
+from ..shared.compound import *
 from .media import *
 from .nodegraph import *
 from .afx import *

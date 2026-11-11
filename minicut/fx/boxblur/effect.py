@@ -1,15 +1,4 @@
 """Box blur: separable, replicated border, 16-bit intermediate targets. Pictures with see-through pixels are left to the CPU (it blurs premultiplied)."""
-from ..pool.cpu_warp import *
-
-def fx_boxblur(img, p, ctx):
-    k = int(max(1, p["size"] * ctx.k)) * 2 + 1; pm = pm4(img)
-    for _ in range(int(p["passes"])): pm = cv2.blur(pm, (k, k), borderType=cv2.BORDER_REPLICATE)
-    return unpm4(pm)
-
-reg("boxblur", BL, "Box blur", [F("size", "Size", 6, 0, 100), I("passes", "Passes", 1, 1, 4)], fx_boxblur, "A plain, fast, even blur (more passes make it smoother).", "average")
-
-
-# ------------------------------------------------------------------ GPU version
 import math
 
 from ..pool.gl import Pass, Built, shaders

@@ -25,7 +25,7 @@ class MainWindow(AutosaveMixin, MediaPreviewMixin, RecordMixin, ProjectMixin, Wo
     """Main window: owns the project, the renderer and the pages (home / workspace / node editor)."""
     def __init__(self):
         super().__init__(); self.setWindowTitle('MiniCut'); self.resize(1440,900); self.setMinimumSize(900,600)
-        self.settings=Settings(); CFG['frame_cache']=self.settings['frame_cache']; CFG['hw_decode']=self.settings['hw_decode']; CFG['bake']=self.settings['bake']; CFG['fx_adapt']=self.settings['fx_adapt']; CFG['bake_max_gb']=self.settings['bake_max_gb']; CFG['encode_hw']=self.settings['encode_hw']; CFG['proxy_height']=self.settings['proxy_height']; CFG['proxy_quality']=self.settings['proxy_quality']; CFG['proxy_budget_gb']=self.settings['proxy_budget_gb']; self.proj=None; self.t=0.0; self.sel=None; self.snap_on=self.settings['snap']; self.playing=False; self._mprev=None; self._undo=[]; self._redo=[]; self._last_state=None; self._clip_copy=None
+        self.settings=Settings(); CFG['frame_cache']=self.settings['frame_cache']; CFG['hw_decode']=self.settings['hw_decode']; CFG['bake']=self.settings['bake']; CFG['fx_adapt']=self.settings['fx_adapt']; CFG['export_preset']=self.settings['export_preset']; CFG['bake_max_gb']=self.settings['bake_max_gb']; CFG['encode_hw']=self.settings['encode_hw']; CFG['proxy_height']=self.settings['proxy_height']; CFG['proxy_quality']=self.settings['proxy_quality']; CFG['proxy_budget_gb']=self.settings['proxy_budget_gb']; self.proj=None; self.t=0.0; self.sel=None; self.snap_on=self.settings['snap']; self.playing=False; self._mprev=None; self._undo=[]; self._redo=[]; self._last_state=None; self._clip_copy=None
         self.thumbs=ThumbStore(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self.audio=AudioPlayer(); self.timer=QTimer(self); self.timer.setInterval(self.frame_ms()); self.timer.timeout.connect(self.tick); self._last_tick=time.monotonic(); self.audio_seek_timer=QTimer(self); self.audio_seek_timer.setSingleShot(True); self.audio_seek_timer.setInterval(60); self.audio_seek_timer.timeout.connect(self._restart_audio_after_seek)
         EXPORTS.max_parallel=int(self.settings['export_parallel']); EXPORTS.job_finished.connect(self._on_export_finished)
         self.stack=QStackedWidget(); self.setCentralWidget(self.stack); self.home=QWidget(); self.stack.addWidget(self.home); self._build_home(); self.editor=QWidget(); self.stack.addWidget(self.editor); self.apply_shortcuts(); self.show_home(); self.autosave_apply()
@@ -117,12 +117,30 @@ class MainWindow(AutosaveMixin, MediaPreviewMixin, RecordMixin, ProjectMixin, Wo
         e.accept()
 
 
+def app_icon():
+    """The program icon (assets/icon.svg), drawn at several sizes so the title bar, taskbar and Alt+Tab each get a sharp one."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.svg"); ic = QIcon()
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+        r = QSvgRenderer(path)
+        if not r.isValid(): return ic
+        for n in (16, 24, 32, 48, 64, 128, 256):
+            pm = QPixmap(n, n); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing); r.render(p, QRectF(0, 0, n, n)); p.end(); ic.addPixmap(pm)
+    except Exception as ex: print("icon load failed", ex)
+    return ic
+
+
 def main():
     try:
         from . import crashlog; crashlog.install_qt()          # Patch 36: Qt's warnings / fatal messages also go to ~/.minicut/crash.log
     except Exception: pass
+    if os.name == "nt":
+        try:
+            import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MiniCut.Editor")      # so the taskbar shows our icon, not python's
+        except Exception: pass
     app=QApplication(sys.argv); app.setApplicationName('MiniCut'); app.setStyle('Fusion'); app.setStyleSheet(QSS)
-    win=MainWindow(); apply_ui(win); win.restore_layout(); install_progress(win); install_gpu_surface()
+    ico = app_icon(); app.setWindowIcon(ico)
+    win=MainWindow(); win.setWindowIcon(ico); apply_ui(win); win.restore_layout(); install_progress(win); install_gpu_surface()
     # apply_perf applies the saved compositing mode using the Settings mapping API.
     # Do not call Settings.get(): this Settings class supports __getitem__, not dict.get.
     apply_perf(win.settings, win.renderer)

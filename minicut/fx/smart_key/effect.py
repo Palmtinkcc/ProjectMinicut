@@ -1,29 +1,5 @@
 """Better Chroma Key on the GPU: matte from the chroma distance, despill, choke / feather, edge colour.
 Same steps and constants as render/smartkey.fx_smart_key. Targets: col = colour, A = matte, inner / z0 / cn / cd = edge-colour helpers."""
-from ...shared.deps import *
-from ...render.effects import _sk, register
-
-register("smart_key", "Key", "Better Chroma Key",
-         [("mode", "Mode", "choice", "color", _sk.MODE_CHOICES, None),
-          ("color", "Background color", "color", "#00ff00", None, None),
-          ("tolerance", "Tolerance", "float", 35.0, 0.0, 100.0),
-          ("softness", "Edge softness", "float", 25.0, 0.0, 100.0),
-          ("spill", "Remove color spill", "float", 60.0, 0.0, 100.0),
-          ("quality", "Render quality", "choice", "normal", _sk.QUALITY_CHOICES, None),
-          ("edge_mode", "Edge color", "choice", "auto", _sk.EDGE_CHOICES, None),
-          ("edge_color", "Edge color", "color", "#303030", None, None),
-          ("edge_width", "Edge width", "float", 3.0, 0.0, 20.0),
-          ("edge_amount", "Edge amount", "float", 70.0, 0.0, 100.0),
-          ("choke", "Shrink / grow edge", "float", 0.0, -20.0, 20.0),
-          ("feather", "Feather", "float", 0.0, 0.0, 20.0),
-          ("view", "View", "choice", "result", _sk.VIEW_CHOICES, None)],
-         _sk.fx_smart_key,
-         help="Background color: pick the screen color; the edge of the subject is repainted so no green fringe is left. "
-              "Select object: paint the object, press Render, and the clip is rendered with the background cut away (works on any background). "
-              "Turn the effect off, delete it or press Undo and the original media comes back.")
-
-
-# ------------------------------------------------------------------ GPU version
 import math
 
 from ..pool.gl import Pass, Built, gauss_chain, shaders

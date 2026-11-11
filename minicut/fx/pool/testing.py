@@ -60,8 +60,7 @@ def main(argv=None):
         print("OpenGL is not available here:", glfx.status()); return 2
     print("GPU:", glfx.status())
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    loader.load_all()
-    ids = argv or [d for d in loader.effect_dirs() if d in loader.BUILDERS]          # only the effects that have a GPU version
+    ids = argv or loader.effect_dirs()
     bad = 0; t0 = time.perf_counter()
     for eid in ids:
         try:

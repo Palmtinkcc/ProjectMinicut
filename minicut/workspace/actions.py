@@ -3,6 +3,7 @@ from ..shared.deps import *
 from ..shared.icons import *
 from ..shared.core import *
 from ..shared.core import _sel_clips, _shift_keys
+from ..shared.compound import *
 from ..shared.ui import *
 from ..shared.widgets import *
 from .timeline import *

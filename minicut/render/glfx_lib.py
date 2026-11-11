@@ -504,5 +504,5 @@ GL_FX = {"tint": b_tint, "bw": b_bw, "invert": b_invert, "adjust": b_adjust, "hu
 
 def load_fx():
     """The effects that live in their own folders (minicut/fx/<id>/) are added to GL_FX here, once. The engine calls this before it looks."""
-    from ..fx import loader
-    loader.load_all(GL_FX)
+    from ..fx.loader import load_all
+    load_all(GL_FX)

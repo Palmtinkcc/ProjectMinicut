@@ -4,6 +4,7 @@ from ..shared.icons import *
 from ..shared.theme import *
 from ..shared.core import *
 from ..shared.core import _group_ids
+from ..shared.compound import compound_wave, wave_signature, wave_at
 from .timeline_ops import (trim_l_bounds, trim_r_bounds, neighbor_before, neighbor_after, touches,
                             propagate_group_delta, vol_to_y, y_to_vol)
 from ..shared.widgets import *
@@ -327,31 +328,29 @@ class Timeline(QWidget):
             v = prop_at(c, "volume", (xi - band.left()) / self.pps) if vk else vconst * 100
             pts.append(QPointF(xi, band.bottom() - min(v, 200) / 200 * band.height()))
         if len(pts) > 1: p.setPen(QPen(QColor(UI["tl_wave_vol"]), 1.2)); p.drawPolyline(QPolygonF(pts))
+    def _compound_curve(self, comp, gain):
+        """(curve, t0) of the sound inside a compound clip. Computed once and kept until something that shapes the sound changes
+        (or until a file's waveform that was still being read is ready), so painting the timeline does not walk the clips again."""
+        cache = self.__dict__.setdefault("_cwave", {}); sig = (wave_signature(comp), gain); hit = cache.get(comp["id"])
+        if hit is not None and hit[0] == sig: return hit[1], hit[2]
+        curve, t0, ok = compound_wave(comp, self.app.thumbs.wave, gain)
+        if ok:
+            cache[comp["id"]] = (sig, curve, t0)
+            while len(cache) > 64: cache.pop(next(iter(cache)))
+        return curve, t0
     def _compound_amp(self, comp, t_inner, gain, depth=0):
-        """Loudness (0..1) of everything inside a compound clip at the compound's inner time. Children that sit on a
-        muted sub-track are skipped, nested compounds are followed, each child's own volume is applied."""
-        if depth > 6: return 0.0
-        muted = {t["id"] for t in comp.get("subtracks", []) if t.get("muted")}; tot = 0.0
-        for k in comp.get("children", []):
-            if not (k["start"] <= t_inner < k["start"] + k["dur"]) or k["track"] in muted: continue
-            lt = t_inner - k["start"]
-            if k["kind"] == "compound":
-                tot += self._compound_amp(k, src_time(k, lt), gain, depth + 1) * prop_at(k, "volume", lt) / 100.0
-            elif k["kind"] in ("audio", "video") and k.get("path"):
-                peaks = self.app.thumbs.wave(k["path"])
-                if peaks is None or not len(peaks): continue
-                idx = int(src_time(k, lt) * 100)
-                if 0 <= idx < len(peaks): tot += min(1.0, peaks[idx] * gain * prop_at(k, "volume", lt) / 100.0)
-        return min(1.0, tot)
+        """Loudness (0..1) of everything inside a compound clip at the compound's inner time."""
+        curve, t0 = self._compound_curve(comp, gain); return wave_at(curve, t0, t_inner)
     def draw_compound_wave(self, p, c, band, W):
         """Waveform of a compound clip: the sound of all the clips inside it, with the compound's own volume, and the
         volume line like on every other clip (drag it to change the volume)."""
         gain = float(self.app.settings["waveform_gain"]); x0, x1 = int(max(band.left(), self.HEAD)), int(min(band.right(), W))
         mid, amp = band.center().y(), band.height() / 2 - 1; lines = []
         vk = c["props"]["volume"]["k"]; vconst = c["props"]["volume"]["v"] / 100
+        curve, ct0 = self._compound_curve(c, gain)
         for xi in range(x0, x1, 2):
             lt = (xi - band.left()) / self.pps
-            a = self._compound_amp(c, src_time(c, lt), gain)          # Patch 53: follows the speed of the compound
+            a = wave_at(curve, ct0, src_time(c, lt))          # follows the speed of the compound
             if a <= 0: continue
             a = min(1.0, a * (prop_at(c, "volume", lt) / 100 if vk else vconst)) * amp
             lines.append(QLineF(xi, mid - a, xi, mid + a))

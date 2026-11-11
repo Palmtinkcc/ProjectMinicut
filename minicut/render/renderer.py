@@ -1,6 +1,7 @@
 """Frame renderer: compositing, masks, text, compound clips and the background preview worker."""
 from ..shared.deps import *
 from ..shared.core import *
+from ..shared.compound import compound_identity, inner_layers
 from .nodegraph import *
 from .effects import apply_effects, clip_spills, time_used
 from .fastcomp import blend_into, blend_mode, visible_rect, resize_part, covers_canvas, to_cv_matrix
@@ -325,6 +326,15 @@ class Renderer:
         if c["kind"] != "video" or p["op"] < 0.999 or c.get("blend", "normal") != "normal": return False      # a compound clip may have transparent parts
         if c.get("effects") or clip_has_mask(c): return False
         return covers_canvas(p["cx"], p["cy"], p["dw"], p["dh"], W, H, p["rot"])
+    def _expand(self, proj, c, t, q, out, depth):
+        """Add the plan of clip c to out. A compound clip with nothing of its own to apply is not drawn as a picture: the clips inside it are
+        planned instead, in its place (any depth), so they are composited by the normal (GPU) path with no extra layer."""
+        if depth == 0: c = node_apply(proj, c, t)
+        if (c.get("kind") == "compound" and depth < 8 and compound_identity(c, t - c["start"], proj.w, proj.h) and not clip_has_mask(c)):
+            for k in inner_layers(c, t): self._expand(proj, k, t, q, out, depth + 1)
+            return
+        p = self._plan(proj, c, t, q)
+        if p: out.append(p)
     def _plans(self, proj, t, q, W, H):
         plans = []
         # Build a per-track index of clips that are active at time t so we do
@@ -336,9 +346,7 @@ class Renderer:
         for tr in reversed([tr for tr in proj.tracks if tr["kind"] == "video"]):
             if tr["hidden"]: continue
             for c in by_track.get(tr["id"], ()):
-                try:
-                    p = self._plan(proj, node_apply(proj, c, t), t, q)
-                    if p: plans.append(p)
+                try: self._expand(proj, c, t, q, plans, 0)
                 except Exception as ex: print("composite error:", ex)
         for i in range(len(plans) - 1, -1, -1):
             if self._hides_everything_below(plans[i], W, H): return plans[i:]
@@ -553,20 +561,17 @@ class Renderer:
             except Exception as ex: print("composite error:", ex)
         return canvas
     def render_alpha(self, proj, t, q):
-        """Patch 53: one frame drawn over a transparent canvas, in ONE pass: (picture over black, alpha), both uint8. The alpha is added up
-        while the layers are drawn (normal compositing, so it is exact). None when a layer uses a blend mode or copy_background: those
-        need the old black-and-white way (see CompoundSource)."""
+        """One frame drawn over a transparent canvas, in ONE pass: (picture over black, alpha), both uint8. The alpha is added up while the
+        layers are drawn. A blend mode inside is drawn with its blend mode and counts as normal for the alpha."""
         depth = getattr(_TLS, "depth", 0); _TLS.depth = depth + 1
         try:
             W, H = max(2, int(round(proj.w * q))), max(2, int(round(proj.h * q)))
             plans = self._plans(proj, t, q, W, H)
-            for p in plans:
-                c = p["c"]
-                if c.get("blend", "normal") != "normal": return None
-                if any(e.get("type") == "copy_background" and e.get("on", True) for e in (c.get("effects") or [])): return None
             canvas = np.zeros((H, W, 3), np.uint8); acc = np.zeros((H, W), np.uint8); precise = q >= 0.999
             for p in plans:
-                try: self._draw_cpu(canvas, p, q, False, precise, acc=acc)
+                try:
+                    need_bg = any(e.get("type") == "copy_background" and e.get("on", True) for e in (p["c"].get("effects") or ()))
+                    self._draw_cpu(canvas, p, q, False, precise, bg=canvas.copy() if need_bg else None, acc=acc)
                 except Exception as ex: print("composite error:", ex)
             return canvas, acc
         finally: _TLS.depth = depth
@@ -588,15 +593,6 @@ class Renderer:
         return img
 
 
-def _alpha_of(black, white):
-    """Alpha (uint8, 0..255) from the same picture drawn over black and over white: 255 - mean(white - black). Patch 38: all in 8 bit with OpenCV
-    (the old version used int16 / float32 numpy on the whole frame, 40+ ms at 1080p, every frame of a compound clip)."""
-    d = cv2.subtract(white, black)
-    g = cv2.transform(d, np.full((1, d.shape[2]), 1.0 / d.shape[2], np.float32)) if d.ndim == 3 else d
-    g = g.reshape(g.shape[:2]) if g.ndim == 3 else g
-    return cv2.bitwise_not(g)          # 255 - g
-
-
 def _unmatte(over_black, alpha):
     """Straight-alpha BGRA from a picture over black (= colour * alpha) and its alpha."""
     al = np.maximum(alpha, 1)
@@ -615,42 +611,23 @@ def _acc_alpha(roi, alpha, op):
 
 
 class CompoundSource:
+    """A compound clip drawn as ONE picture (only when it has its own opacity / move / scale / effect / mask / blend / speed; otherwise its
+    clips are drawn straight into the parent, see Renderer._expand). One pass over a transparent canvas gives the picture and its alpha."""
     def __init__(self, c, renderer):
         self.c = c; self.r = renderer
         self.w = int(c.get("cw", 1920)); self.h = int(c.get("chh", 1080)); self.fps = c.get("cfps", 30); self.n = 10 ** 9
-    def _over(self, t, ds, bg):
-        p = Project("compound", self.w, self.h, self.fps)
-        p.clips = self.c.get("children", []); p.tracks = self.c.get("subtracks", []); p.bg = bg
-        return self.r.render(p, float(t), ds, False)
+        self.proj = Project("compound", self.w, self.h, self.fps)
+        self.proj.clips = c.get("children", []); self.proj.tracks = c.get("subtracks", [])
+        self._ac = OrderedDict()
     def frame_auto(self, t, ds=1.0):
-        """(picture, opaque). Patch 53: ONE pass. The clips inside are drawn over a transparent canvas and their alpha is added up next to the
-        picture (exact for normal compositing). A compound inside a compound now costs one pass per level; before it was two to four, and
-        it doubled with every level. A blend mode / copy_background inside still uses the old black-and-white way."""
-        key = (round(float(t), 4), ds); cache = self.__dict__.setdefault("_ac", OrderedDict()); hit = cache.get(key)
-        if hit is not None: cache.move_to_end(key); return hit
-        r = self._alpha_pass(t, ds)
-        if r is None: res = self._frame_auto_bw(t, ds)
-        else:
-            pic, alpha = r
-            res = (pic, True) if cv2.minMaxLoc(alpha)[0] >= 250 else (_unmatte(pic, alpha), False)
-        cache[key] = res
-        while len(cache) > 12: cache.popitem(last=False)
+        """(picture, opaque): BGR + True when nothing inside is transparent, else straight-alpha BGRA + False."""
+        key = (round(float(t), 4), ds); hit = self._ac.get(key)
+        if hit is not None: self._ac.move_to_end(key); return hit
+        pic, alpha = self.r.render_alpha(self.proj, float(t), ds)
+        res = (pic, True) if cv2.minMaxLoc(alpha)[0] >= 250 else (_unmatte(pic, alpha), False)
+        self._ac[key] = res
+        while len(self._ac) > 8: self._ac.popitem(last=False)
         return res
-    def _alpha_pass(self, t, ds):
-        p = Project("compound", self.w, self.h, self.fps)
-        p.clips = self.c.get("children", []); p.tracks = self.c.get("subtracks", [])
-        return self.r.render_alpha(p, float(t), ds)
-    def _frame_auto_bw(self, t, ds):
-        """The old way (Patch 40): drawn once over black and once over white; where the two differ nothing is drawn there."""
-        a = self._over(t, ds, "#000000"); pd = max(0.125, min(0.25, ds * 0.25))
-        if getattr(self, "_was_transparent", False): opaque = False
-        else:
-            tb = self._over(t, pd, "#000000"); tw = self._over(t, pd, "#ffffff")
-            opaque = bool(_alpha_of(tb, tw).min() >= 250)
-        if opaque: return (a, True)
-        b = self._over(t, ds, "#ffffff"); alpha = _alpha_of(a, b)
-        if alpha.min() >= 250: self._was_transparent = False; return (a, True)
-        self._was_transparent = True; return (_unmatte(a, alpha), False)
     def frame_bgr(self, t, ds=1.0):
         img, opaque = self.frame_auto(t, ds); return img if opaque else np.ascontiguousarray(img[..., :3])
     def frame(self, t, ds=1.0):

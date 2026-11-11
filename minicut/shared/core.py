@@ -322,7 +322,7 @@ class Settings:
                   "fit_viewport": True, "gpu_compose": "auto", "render_threads": 0, "preview_ram_mb": 512, "low_priority": True, "proxy_hw": "auto", "audio_cache_gb": 8,
                   "migrated_v21": False, "waveform_gain": 3.0, "export_parallel": 2, "audio_input": "", "autosave": True, "autosave_min": 1,
                   "snap": True, "show_fps": False, "bake": False, "fx_adapt": True, "bake_max_gb": 2, "default_w": 1920, "default_h": 1080, "default_fps": 30,
-                  "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
+                  "export_preset": "fast", "export_space": 2, "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
         try:
             with open(self.file, "r", encoding="utf-8") as f: d = json.load(f)
             sc = d.pop("shortcuts", {}); self.d.update(d); self.d["shortcuts"].update(sc)
@@ -410,88 +410,6 @@ class Project:
 
 def _shift_keys(clip, cut):
     for pr in clip["props"].values(): pr["k"] = [dict(k, t=k["t"] - cut) for k in pr["k"] if k["t"] >= cut]
-
-
-def _bake_ancestor_volume(n, ancestors):
-    """Fold every ancestor compound's own volume (its 'v', or its keyframes if it is animated) into n's volume, so the
-    volume set on a compound clip (and automation on it) is heard in the preview, at any nesting depth."""
-    const = 1.0; animated = False
-    for comp, _ in ancestors:
-        if comp["props"]["volume"]["k"]: animated = True
-        else: const *= comp["props"]["volume"]["v"] / 100.0
-    if not animated:
-        if const != 1.0:
-            n["props"]["volume"]["v"] = n["props"]["volume"]["v"] * const
-            for k in n["props"]["volume"]["k"]: k["v"] = k["v"] * const
-        return
-    s, e = n["start"], n["start"] + n["dur"]; step = max(1.0 / 20, (e - s) / 200.0)
-    times = []; t = s
-    while t < e - 1e-9: times.append(t); t += step
-    times.append(e)
-    def total(t_abs):
-        v = prop_at(n, "volume", t_abs - n["start"])
-        for comp, abs_start in ancestors: v *= prop_at(comp, "volume", t_abs - abs_start) / 100.0
-        return v
-    n["props"]["volume"]["k"] = [{"t": t - n["start"], "v": total(t), "e": [0, 0, 1, 1]} for t in times]
-    n["props"]["volume"]["v"] = n["props"]["volume"]["k"][0]["v"] if n["props"]["volume"]["k"] else n["props"]["volume"]["v"]
-
-
-def compound_rate(comp):
-    """Patch 53: how fast the inside of a compound clip runs (1.0 = normal). With a keyframed speed: the average over the clip."""
-    if not clip_has_speed(comp) or comp.get("dur", 0) <= 1e-9: return 1.0
-    return max(1e-3, (src_time(comp, comp["dur"]) - comp["inp"]) / comp["dur"])
-
-
-def compound_view(comp, ch):
-    """Patch 53: a clip inside a compound clip as it must sit on the inner timeline when the compound has a speed of s: s times faster
-    means it starts and ends 1/s as late, its keyframes are 1/s as far apart and its own speed is multiplied by s (so its sound follows)."""
-    s = compound_rate(comp)
-    if abs(s - 1.0) < 1e-9: return ch
-    n = copy.deepcopy(ch); i0 = comp["inp"]
-    n["start"] = i0 + (ch["start"] - i0) / s; n["dur"] = ch["dur"] / s
-    for pr in n["props"].values():
-        for k in pr["k"]: k["t"] = k["t"] / s
-    sp = n["props"].get("speed")
-    if sp is not None and n.get("kind") in SPEED_KINDS:
-        sp["v"] = sp["v"] * s
-        for k in sp["k"]: k["v"] = k["v"] * s
-    if comp.get("pitch_follow"): n["pitch_follow"] = True
-    return n
-
-
-def flatten_compounds(proj):
-    """Replace every compound clip (at any nesting depth) with its children, placed at their place on the main
-    timeline. Each child's volume is multiplied by the volume (constant or animated) of every compound clip it sits
-    inside, so the volume you set on a compound is actually heard."""
-    clips = getattr(proj, "clips", None)
-    if not clips or not any(c.get("kind") == "compound" for c in clips): return proj
-    p = copy.copy(proj); p.clips = []; p.tracks = list(proj.tracks)
-
-    def walk(items, off, ancestors, lo, hi):
-        for c in items:
-            if c.get("kind") == "compound":
-                if not ancestors:
-                    tr = proj.track(c["track"])
-                    if tr and tr.get("muted"): continue
-                a, b = c["start"] + off, c["start"] + off + c["dur"]
-                nlo, nhi = max(lo, a), min(hi, b)
-                if nhi <= nlo: continue
-                p.tracks += c.get("subtracks", [])
-                kids = c.get("children", [])
-                if abs(compound_rate(c) - 1.0) > 1e-9: kids = [compound_view(c, k) for k in kids]        # Patch 53: speed of the compound
-                walk(kids, off + c["start"] - c["inp"], ancestors + [(c, a)], nlo, nhi)
-            else:
-                if c["kind"] not in ("audio", "video"): continue
-                s, e = c["start"] + off, c["start"] + off + c["dur"]; s2, e2 = max(s, lo), min(e, hi)
-                if e2 <= s2: continue
-                n = copy.deepcopy(c) if (s2 > s or ancestors) else dict(c)
-                n["start"], n["dur"], n["inp"] = s2, e2 - s2, c["inp"] + src_delta(c, s2 - s)
-                if s2 > s: _shift_keys(n, s2 - s)
-                if ancestors: _bake_ancestor_volume(n, ancestors)
-                p.clips.append(n)
-
-    walk(clips, 0.0, [], float("-inf"), float("inf"))
-    return p
 
 
 SIZE_PRESETS = [("16:9  Landscape · 1920×1080", 1920, 1080), ("9:16  Vertical · 1080×1920", 1080, 1920), ("1:1  Square · 1080×1080", 1080, 1080),

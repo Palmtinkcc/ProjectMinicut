@@ -59,11 +59,12 @@ def pick_hw_encoder(hevc=False, choice=None):
     return None
 
 
-def hw_quality_args(vendor, crf, out_w):
-    """Quality options for each GPU encoder (they do not accept the x264 -crf / -preset options)."""
-    if vendor == "nvenc": return ["-preset", "p4", "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
-    if vendor == "qsv": return ["-global_quality", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"]
-    return ["-quality", "balanced", "-b:v", ("8M" if out_w >= 1920 else "4M"), "-pix_fmt", "yuv420p"]
+def hw_quality_args(vendor, crf, out_w, preset="fast"):
+    """Quality options for each GPU encoder (they do not accept the x264 -crf / -preset options). preset: Settings > Export preset."""
+    from .optimize import NVENC_PRESET, QSV_PRESET, AMF_QUALITY
+    if vendor == "nvenc": return ["-preset", NVENC_PRESET.get(preset, "p4"), "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if vendor == "qsv": return ["-global_quality", str(crf), "-preset", QSV_PRESET.get(preset, "medium"), "-pix_fmt", "yuv420p"]
+    return ["-quality", AMF_QUALITY.get(preset, "balanced"), "-b:v", ("8M" if out_w >= 1920 else "4M"), "-pix_fmt", "yuv420p"]
 
 
 GPU_CODECS = {"h264": {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "amf": "h264_amf"},
