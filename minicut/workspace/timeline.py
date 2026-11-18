@@ -2,6 +2,8 @@
 from ..shared.deps import *
 from ..shared.icons import *
 from ..shared.theme import *
+from ..shared import marks as MK
+from ..shared import marks_ui as MKU
 from ..shared.core import *
 from ..shared.core import _group_ids
 from ..shared.compound import compound_wave, wave_signature, wave_at
@@ -153,13 +155,12 @@ class Timeline(QWidget):
                     lab = f"{int(t // 60):02d}:{int(t % 60):02d}" + (f".{int(round((t % 1) * self.app.proj.fps)):02d}f" if major < 1 else "")
                     p.drawText(QPointF(x + 4, 13), lab)
             i += 1
-        for mk in getattr(self.app.proj, "markers", ()):          # Patch 42: markers
+        P = self.app.proj
+        if P.beat_grid.get("show"): MKU.draw_beat_ticks(p, P.beat_grid, max(0.0, self.x2t(self.HEAD)), self.x2t(W), self.t2x, self.RULER, self.HEAD, W)      # Patch 44: beat lines
+        for mk in getattr(P, "markers", ()):          # Patch 42/44: marks (own colour, line down through the tracks)
             mx = self.t2x(mk)
             if mx >= self.HEAD - 6:
-                p.setPen(Qt.NoPen); p.setBrush(QColor("#f59e0b")); pg = QPainterPath()
-                pg.moveTo(mx - 5, self.RULER - 12); pg.lineTo(mx + 5, self.RULER - 12); pg.lineTo(mx + 5, self.RULER - 5); pg.lineTo(mx, self.RULER); pg.lineTo(mx - 5, self.RULER - 5); pg.closeSubpath(); p.drawPath(pg)
-                nm = getattr(self.app.proj, "marker_names", {}).get("%.3f" % mk)
-                if nm: p.setPen(QColor("#f59e0b")); p.drawText(QPointF(mx + 8, self.RULER - 5), nm)
+                MKU.draw_mark_flag(p, mx, 0, self.RULER, MK.color_of(P, mk), P.marker_names.get("%.3f" % mk, ""), line_to=self.height() if mx >= self.HEAD else None, selected=bool(self.drag and self.drag.get("mode") == "markdrag" and abs(self.drag.get("cur", -9) - mk) < 1e-3))
         p.fillRect(QRect(0, 0, self.HEAD, self.RULER), QColor(UI["tl_ruler_bg"]))
         p.setPen(QColor("#5aa2ff")); p.drawText(QRect(10, 0, self.HEAD, self.RULER), Qt.AlignVCenter, fmt_time(self.app.t, self.app.proj.fps))
     def _draw_clip_core(self, p, c, y, h, W):
@@ -168,7 +169,7 @@ class Timeline(QWidget):
         r = QRectF(x, y + 2, max(w, 3), h - 4); col = QColor(CLIP_COLORS.get(c["kind"], "#1f4fbf"))
         sel = c["id"] == self.app.sel; path = QPainterPath(); path.addRoundedRect(r, UI["tl_radius"], UI["tl_radius"])
         p.save(); p.setClipPath(path, Qt.IntersectClip); p.fillRect(r, col.darker(140)); k = c["kind"]
-        if k in ("video", "image", "gif"):
+        if k in ("video", "image", "gif", "bone2d"):
             th = int(r.height() - (16 if k == "video" else 0))
             if th > 8:
                 first = self.app.thumbs.thumb(c["path"], k, c["inp"] if k == "video" else 0, th)
@@ -403,6 +404,7 @@ class Timeline(QWidget):
         if QApplication.keyboardModifiers() & (Qt.ShiftModifier | Qt.ControlModifier): on = not on
         if not on: return t, None
         thr = 8 / self.pps; best = None
+        if getattr(self.app, "proj", None) is not None: pts = list(pts) + MK.beat_snap_points(self.app.proj, t, thr * 1.5)       # Patch 44: Lock to beat
         for s in pts:
             d = abs(s - t)
             if d < thr and (best is None or d < best[0]): best = (d, s)
@@ -413,6 +415,9 @@ class Timeline(QWidget):
         if e.button() == Qt.MiddleButton: self.drag = {"mode": "pan", "x": x, "y": y, "h": self.hbar.value(), "v": self.vbar.value()}; return
         if e.button() != Qt.LeftButton: return
         if y < self.RULER and x >= self.HEAD:
+            hit = self.mark_hit(x)
+            if hit is not None:                                            # Patch 44: drag a mark along the ruler (it locks to the beat when that is on)
+                app.seek(hit); self.drag = {"mode": "markdrag", "cur": hit, "moved": False, "before": app.begin(), "x0": x}; return
             self.drag = {"mode": "scrub"}; t, self.snap_line = self.snap(max(0.0, self.x2t(x)), self.key_snap_points()); app.seek(t); return
         if x < self.HEAD:
             for tr, ty, h in self.lanes():
@@ -453,9 +458,19 @@ class Timeline(QWidget):
                     self.drag["nbr_keys"] = copy.deepcopy(nb["props"])
         else:
             self.start_marquee(x, y, in_lane, add)
+    def mark_hit(self, x):
+        """The time of the mark under x on the ruler (within 7 px), or None."""
+        P = self.app.proj
+        if not P or not P.markers: return None
+        best = min(P.markers, key=lambda v: abs(self.t2x(v) - x)); return best if abs(self.t2x(best) - x) <= 7 else None
     def _move_core(self, e):
         if not self.app.proj: return
         pos = e.position(); x, y = pos.x(), pos.y(); d = self.drag; app = self.app
+        if not d and y < self.RULER and x >= self.HEAD:
+            self.setCursor(Qt.SizeHorCursor if self.mark_hit(x) is not None else Qt.ArrowCursor); return
+        if d and d["mode"] == "markdrag":
+            if not d["moved"] and abs(x - d["x0"]) < 3: return
+            d["moved"] = True; d["cur"] = MK.move_mark(app.proj, d["cur"], max(0.0, self.x2t(x)), app.proj.fps); self.update(); return
         if not d:
             hit = self.hit_clip(x, y) if x > self.HEAD and y > self.RULER else None
             kh = self.key_hit(x, y) if x > self.HEAD and y > self.RULER else None
@@ -527,6 +542,9 @@ class Timeline(QWidget):
         app.request_render(); self.update()
     def mouseReleaseEvent(self, e):
         d = self.drag; self.drag = None; self.snap_line = None; app = self.app
+        if d and d["mode"] == "markdrag":
+            if d["moved"]: app.commit(d["before"]); app.seek(d["cur"])
+            self.update(); return
         if d and d["mode"] == "vol":
             app.commit(d["before"]); app.on_changed()
         if d and d["mode"] == "keymove" and d["moved"]:
@@ -576,6 +594,11 @@ class Timeline(QWidget):
         if i is None: return False
         rest.insert(i, tr); pr.tracks = rest
         return [t["id"] for t in pr.tracks] != old
+    touch_ok = True; touch_menu = True                                  # Touch: pinch = zoom time, two fingers = scroll, long press = menu
+    def touch_pinch(self, f, pos): self.set_zoom(self.pps * f, (self.x2t(pos.x()), pos.x()))
+    def touch_pan(self, dx, dy):
+        self.hbar.setValue(int(self.hbar.value() - dx))
+        if self.vbar.isVisible(): self.vbar.setValue(int(self.vbar.value() - dy))
     def wheelEvent(self, e):
         dy, dx = e.angleDelta().y(), e.angleDelta().x()
         if e.modifiers() & Qt.ControlModifier:
@@ -594,13 +617,8 @@ class Timeline(QWidget):
     def _context_core(self, e):
         if not self.app.proj: return
         x, y = e.pos().x(), e.pos().y(); app = self.app; m = QMenu(self)
-        if y < self.RULER and x >= self.HEAD:                    # Patch 42: markers
-            t = self.x2t(x); mk = list(getattr(app.proj, "markers", ()) or ()); near = min(mk, key=lambda v: abs(v - t)) if mk else None
-            m.addAction("Add / remove marker at the playhead", app.add_marker)
-            if near is not None and abs(near - t) * self.pps < 10:
-                m.addAction("Rename this marker...", lambda: app.rename_marker(near)); m.addAction("Delete this marker", lambda: app.remove_marker(near))
-            if mk: m.addAction("Delete all markers", app.clear_markers)
-            m.exec(e.globalPos()); return
+        if y < self.RULER and x >= self.HEAD:                    # Patch 42/44: marks (same menu in Bone2D)
+            MKU.build_mark_menu(m, app.proj, self.x2t(x), self.pps, app.mark_hooks()); m.exec(e.globalPos()); return
         if x < self.HEAD:
             lane = next(((tr, ty, h) for tr, ty, h in self.lanes() if ty <= y < ty + h), None)
             if lane:
@@ -837,7 +855,7 @@ class TimelinePanel(QFrame):
         super().__init__(); self.setObjectName("Panel"); self.setMinimumSize(1, 1); self.app = app
         lay = QVBoxLayout(self); lay.setContentsMargins(8, 6, 8, 6); lay.setSpacing(4)
         head = QHBoxLayout(); head.setSpacing(8)
-        self.tabs = Segmented([("Timeline", "t"), ("Nodes", "n")], "t"); self.tabs.setFixedSize(190, 30); self.tabs.changed.connect(lambda v: self.show_nodes(v == "n")); head.addWidget(self.tabs)
+        self.tabs = Segmented([("Timeline", "t"), ("Nodes", "n"), ("Bone2D", "b")], "t"); self.tabs.setFixedSize(285, 30); self.tabs.changed.connect(self._mode); head.addWidget(self.tabs)
         # Patch 50: FX Library button
         from ..shared.widgets import tool
         _fx_lib_btn = tool("", "FX Library — manage & create custom effects", app.open_fx_library, icon="effects", isize=20)
@@ -856,7 +874,8 @@ class TimelinePanel(QFrame):
         add("Duplicate", "duplicate", "Copy the clip right after itself", app.duplicate, prio=3); add("Delete", "delete", "Delete the clip (Del)", app.delete_sel, prio=3); sep()
         add("Text", "text", "Add a text clip at the playhead", app.add_text); self.rec_btn = add("Record", "mic", "Record your voice: click to start, click again to stop", app.toggle_record)
         add("Keyframe", "keyframe", "Add a keyframe at the playhead", app.key_all, prio=2)
-        add("", "chevron_left", "Previous marker (Alt+Left)", lambda: app.goto_marker(-1)); add("Marker", "flag", "Add or remove a marker at the playhead (M)", app.add_marker, prio=2); add("", "chevron_right", "Next marker (Alt+Right)", lambda: app.goto_marker(1)); sep()
+        add("", "chevron_left", "Previous marker (Alt+Left)", lambda: app.goto_marker(-1)); add("Marker", "flag", "Add or remove a marker at the playhead (M)", app.add_marker, prio=2); add("", "chevron_right", "Next marker (Alt+Right)", lambda: app.goto_marker(1))
+        add("Auto mark", "auto_fix_high", "Mark the beats or hits of the sound automatically, coloured by the sound", A("auto_mark"), prio=2); self.beat_btn = add("Beat lock", "link", "Lock to beat: new and moved marks snap to the beat", A("toggle_beat_lock"), checkable=True, prio=2); sep()
         add("Group", "group", "Make the selected clips move together (Ctrl+G)", A("group_sel"), prio=1); add("Compound", "compound", "Fold the selected clips into one clip (Alt+G)", A("make_compound"), prio=1); sep()
         add("Extract", "extract", "Take the sound out of a video as its own clip", A("extract_audio"), prio=1); add("Replace", "replace", "Swap the media of this clip, keep the edits", A("replace_media"), prio=2); sep()
         self.track_btn = add("Track", "plus", "Add a video or an audio track", self._track_menu, prio=1)
@@ -878,6 +897,9 @@ class TimelinePanel(QFrame):
         app.nodes_page = NodeDock(app); self.stack.addWidget(app.nodes_page)
         # Patch 50: FX Node Editor overlay (opened on demand, not pre-created)
         app._fx_node_editor = None
+    def _mode(self, v):
+        if v == "b": self.tabs.setValue("n" if self.stack.currentIndex() == 1 else "t"); self.app.bone2d_menu(); return      # Bone2D is a page of its own, the tab only opens it
+        self.show_nodes(v == "n")
     def _track_menu(self):
         m = QMenu(self); m.addAction("Add video track", lambda: self.app.add_track("video")); m.addAction("Add audio track", lambda: self.app.add_track("audio")); m.exec(self.track_btn.mapToGlobal(QPoint(0, self.track_btn.height())))
     def resizeEvent(self, e):

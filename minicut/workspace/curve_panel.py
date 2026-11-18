@@ -20,9 +20,10 @@ def all_presets(settings):
 
 class PresetTile(QWidget):
     clicked = Signal(object)
-    def __init__(self, name, curve, selected=False):
-        super().__init__(); self.name = name; self.curve = [float(v) for v in curve]; self.selected = selected
-        self.setMinimumSize(70, 88); self.setFixedHeight(88); self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.setCursor(Qt.PointingHandCursor); self.setToolTip(name)
+    def __init__(self, name, curve, selected=False, h=88):
+        """h = tile height; Bone2D's small curve panel uses a low tile (h=62) so the same tiles fit there."""
+        super().__init__(); self.name = name; self.curve = [float(v) for v in curve]; self.selected = selected; self.small = h < 80
+        self.setMinimumSize(70, h); self.setFixedHeight(h); self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.setCursor(Qt.PointingHandCursor); self.setToolTip(name)
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton: self.clicked.emit(self.curve)
     def enterEvent(self, e): self._h = True; self.update()
@@ -30,11 +31,11 @@ class PresetTile(QWidget):
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); acc = QColor(UI["ui_accent"]); h = getattr(self, "_h", False)
         p.setPen(QPen(acc if (self.selected or h) else QColor("#34343c"), 2 if self.selected else 1)); p.setBrush(QColor("#2a2a30" if h else "#222227")); p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 10, 10)
-        r = QRectF(self.rect()).adjusted(14, 12, -14, -28)
+        r = QRectF(self.rect()).adjusted(10, 7, -10, -19) if self.small else QRectF(self.rect()).adjusted(14, 12, -14, -28)
         def mp(x, y): return QPointF(r.left() + x * r.width(), r.bottom() - (y + 0.4) / 1.8 * r.height())
         base = QPainterPath(mp(0, 0)); path = QPainterPath(mp(0, 0))
         for x, y in bezier_points(self.curve)[1:]: path.lineTo(mp(x, y))
         p.setPen(QPen(QColor("#3a3a44"), 1, Qt.DashLine)); p.drawLine(mp(0, 0), mp(1, 1))
         p.setPen(QPen(acc, 2.6, Qt.SolidLine, Qt.RoundCap)); p.setBrush(Qt.NoBrush); p.drawPath(path)
         p.setPen(QColor("#ececf1" if self.selected else "#9aa0aa")); f = QFont(p.font()); f.setPixelSize(11); f.setBold(self.selected); p.setFont(f)
-        p.drawText(QRectF(0, self.height() - 24, self.width(), 20), Qt.AlignCenter, p.fontMetrics().elidedText(self.name, Qt.ElideRight, self.width() - 8))
+        p.drawText(QRectF(0, self.height() - (17 if self.small else 24), self.width(), 16 if self.small else 20), Qt.AlignCenter, p.fontMetrics().elidedText(self.name, Qt.ElideRight, self.width() - 8))

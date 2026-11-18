@@ -94,8 +94,10 @@ class SettingsDialog(AnimatedDialog):
         self.fit_cb = QCheckBox("Draw at display size (saves GPU)"); self.fit_cb.setChecked(bool(s["fit_viewport"]))
         self.adapt = QCheckBox("Auto-lower detail when slow"); self.adapt.setChecked(bool(s["adaptive_preview"]))
         self.hwdec = QCheckBox("GPU video decode (each file is checked against the CPU decoder; falls back to CPU)"); self.hwdec.setChecked(bool(s["hw_decode"]))
-        self.showfps = QCheckBox("Show Frame build Preview"); self.showfps.setChecked(bool(s["show_fps"]))
+        self.showfps = QCheckBox("Show FPS on the preview"); self.showfps.setChecked(bool(s["show_fps"]))
         self.showfps.setToolTip("Shows the FPS and how many milliseconds each frame takes to build, in the top-left corner of the preview.")
+        self.build_pv = QCheckBox("Show Frame build Preview"); self.build_pv.setChecked(bool(s["show_build_preview"]))
+        self.build_pv.setToolTip("In the Tasks window, shows the frame that an export is building at the moment, next to its progress bar.")
         self.bake_cb = QCheckBox("Adaptive proxy: bake heavy segments in the background (experimental)"); self.bake_cb.setChecked(bool(s["bake"]))
         self.bake_cb.setToolTip("When you stop editing, the heavy parts of the timeline (ALL layers combined, with their effects) are rendered once into small files and played from them.")
         self.fxadapt = QCheckBox("Slow effects use fewer pixels while playing (full quality when stopped)"); self.fxadapt.setChecked(bool(s["fx_adapt"]))
@@ -110,6 +112,10 @@ class SettingsDialog(AnimatedDialog):
         self.ram_box = QComboBox()
         for mb in (128, 256, 512, 1024, 2048): self.ram_box.addItem("%d MB" % mb, mb)
         self.ram_box.setCurrentIndex(max(0, self.ram_box.findData(int(s["preview_ram_mb"]))))
+        self.ramlim_box = QComboBox()
+        for mb in (768, 1024, 1536, 2048, 3072, 0): self.ramlim_box.addItem("No limit" if not mb else "%.1f GB" % (mb / 1024.0), mb)
+        self.ramlim_box.setToolTip("The program (preview, caches and the encoders of an export) is kept under this size: the caches are made smaller and fewer export pieces run at once.")
+        self.ramlim_box.setCurrentIndex(max(0, self.ramlim_box.findData(int(s["ram_limit_mb"]))))
         self.prio_cb = QCheckBox("Keep render thread below window priority"); self.prio_cb.setChecked(bool(s["low_priority"]))
         self.proxy_cb = QCheckBox("Enable proxy (background down-scaled copies)"); self.proxy_cb.setChecked(bool(s["proxy_preview"]))
         self.p_h = QComboBox(); [self.p_h.addItem("%dp" % v, v) for v in (360, 540, 720)]; self.p_h.setCurrentIndex(max(0, self.p_h.findData(int(s["proxy_height"]))))
@@ -181,10 +187,10 @@ class SettingsDialog(AnimatedDialog):
         ob = QPushButton("Optimize for me"); ob.clicked.connect(self.optimize); self.use_btn = QPushButton("Use this Setting"); self.use_btn.setObjectName("Accent"); self.use_btn.setEnabled(False); self.use_btn.clicked.connect(self.use_recommended)
         h = QHBoxLayout(); h.addWidget(ob); h.addStretch(1); h.addWidget(self.use_btn); c.body.addLayout(h)
         c, f = self.sec(P, "Viewport & Preview", "image")
-        for lab, wd in (("Quality", self.q), ("Filter", self.interp), ("Preview FPS", self.fps), ("Frame cache", self.cache), ("Waveform height", self.wave_gain), ("", self.reduce), ("", self.fit_cb), ("", self.adapt)): self.row(P, c, f, lab, wd)
+        for lab, wd in (("Quality", self.q), ("Filter", self.interp), ("Preview FPS", self.fps), ("Frame cache", self.cache), ("Waveform height", self.wave_gain), ("", self.reduce), ("", self.fit_cb), ("", self.adapt), ("", self.showfps)): self.row(P, c, f, lab, wd)
         c, f = self.sec(P, "GPU & Rendering", "effects")
         bake_clear = QPushButton("Clear baked proxies"); bake_clear.clicked.connect(self.clear_bake)
-        for lab, wd in (("", self.hwdec), ("", self.bake_cb), ("", self.bake_gb), ("", bake_clear), ("", self.fxadapt), ("Render threads", self.thr_box), ("RAM cache", self.ram_box), ("", self.prio_cb)): self.row(P, c, f, lab, wd)
+        for lab, wd in (("", self.hwdec), ("", self.bake_cb), ("", self.bake_gb), ("", bake_clear), ("", self.fxadapt), ("Render threads", self.thr_box), ("RAM cache", self.ram_box), ("Max RAM", self.ramlim_box), ("", self.prio_cb)): self.row(P, c, f, lab, wd)
         c, f = self.sec(P, "Recording", "mic"); self.row(P, c, f, "Microphone", self.mic)
 
     def _build_storage(self, s):
@@ -220,7 +226,7 @@ class SettingsDialog(AnimatedDialog):
         two.addLayout(l, 3); two.addLayout(r, 2); c.body.addLayout(two); c.body.addWidget(self.exp_hint)
         self._rows.append((P, c, None, self.preset_list, "preset quality balance fast ultra fast just don't waste my time full space space save storage 80% 50% 40%"))
         c, f = self.sec(P, "Rendering", "effects")
-        self.row(P, c, f, "", self.showfps); self.row(P, c, f, "", self.mt)
+        self.row(P, c, f, "", self.build_pv); self.row(P, c, f, "", self.mt)
         gb = QPushButton("Check GPU encoders"); gb.clicked.connect(self.check_gpu)
         self.row(P, c, f, "Export encoder", self.enc); self.row(P, c, f, "", gb); self.row(P, c, f, "GPU encoders", self.enc_lbl)
 
@@ -393,12 +399,12 @@ class SettingsDialog(AnimatedDialog):
         s["asset_folder"] = self.asset.text(); s["project_folder"] = self.projf.text() or s["project_folder"]; s["export_folder"] = self.expf.text()
         s["preview_quality"] = self.q.currentData(); s["preview_interp"] = "fast" if self.interp.currentIndex() == 1 else "smooth"
         s["waveform_gain"] = float(self.wave_gain.value()); s["play_reduce"] = self.reduce.isChecked(); s["frame_cache"] = self.cache.value(); CFG["frame_cache"] = self.cache.value()
-        s["preview_fps"] = int(self.fps.currentData()); s["adaptive_preview"] = self.adapt.isChecked(); s["hw_decode"] = self.hwdec.isChecked(); s["show_fps"] = self.showfps.isChecked()
+        s["preview_fps"] = int(self.fps.currentData()); s["adaptive_preview"] = self.adapt.isChecked(); s["hw_decode"] = self.hwdec.isChecked(); s["show_fps"] = self.showfps.isChecked(); s["show_build_preview"] = self.build_pv.isChecked(); CFG["show_build_preview"] = s["show_build_preview"]; CFG["render_threads"] = int(self.thr_box.currentData())
         s["bake"] = self.bake_cb.isChecked(); s["fx_adapt"] = self.fxadapt.isChecked(); s["bake_max_gb"] = int(self.bake_gb.currentData()); s["encode_hw"] = self.enc.currentData()
         s["proxy_preview"] = self.proxy_cb.isChecked(); s["proxy_height"] = int(self.p_h.currentData()); s["proxy_quality"] = int(self.p_q.currentData())
         CFG["proxy_height"] = s["proxy_height"]; CFG["proxy_quality"] = s["proxy_quality"]; s["proxy_budget_gb"] = int(self.p_budget.value()); CFG["proxy_budget_gb"] = s["proxy_budget_gb"]
         s["fit_viewport"] = self.fit_cb.isChecked(); s["gpu_compose"] = self.api_mode(); s["render_threads"] = int(self.thr_box.currentData())
-        s["preview_ram_mb"] = int(self.ram_box.currentData()); s["low_priority"] = self.prio_cb.isChecked(); s["proxy_hw"] = self.phw_box.currentData(); s["audio_cache_gb"] = int(self.audio_gb.value())
+        s["preview_ram_mb"] = int(self.ram_box.currentData()); s["ram_limit_mb"] = int(self.ramlim_box.currentData()); s["low_priority"] = self.prio_cb.isChecked(); s["proxy_hw"] = self.phw_box.currentData(); s["audio_cache_gb"] = int(self.audio_gb.value())
         s["export_preset"] = EXPORT_PRESETS[self.preset_list.index()][0]; s["export_space"] = int(self.space_list.index()); CFG["export_preset"] = s["export_preset"]
         if "export_parallel" in self._extra:
             s["export_parallel"] = int(self._extra["export_parallel"])

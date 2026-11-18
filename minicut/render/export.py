@@ -9,6 +9,8 @@ from .renderer import *
 from ..shared.hwaccel import *
 from ..shared.tasks import TASKS
 from ..shared.optimize import X264_PRESET, SVT_PRESET, AOM_CPU_USED, export_crf
+from . import export_par as XP
+from .perf import render_threads as _render_threads
 import functools, queue, threading
 
 
@@ -25,6 +27,9 @@ FORMATS = OrderedDict([("mp4", ("MP4 · H.264", ".mp4")), ("mp4_265", ("MP4 · H
                        ("png", ("PNG sequence", "")), ("mp3", ("MP3 · audio only", ".mp3")), ("wav", ("WAV · audio only", ".wav"))])
 
 
+from . import ramgov as _RAM
+
+
 class ExportWorker(QThread):
     """One export, running in its own thread. It can be cancelled at any moment: the encoder is stopped, the half-written
     file is deleted. States: queued -> running -> done / failed / cancelled."""
@@ -33,14 +38,24 @@ class ExportWorker(QThread):
     finished_job = Signal(object, bool, str)       # (this worker, ok, message): delivered to the manager in the main thread
     def __init__(self, pd, opts, task=None):
         super().__init__(); self.pd = pd; self.o = opts; self.cancel = False; self._proc = None; self._task = task
+        self.thumb = None; self._thumb_t = 0.0; self._procs = []; self._plock = threading.Lock()      # thumb: (small BGR picture, frame, total) of the frame being built, for the Tasks window
         self.state = "queued"; self.msg = ""; self.out = opts["path"]; self.title = os.path.basename(opts["path"].rstrip("/\\")) or opts["path"]
     def request_cancel(self):
         """Stop as soon as possible: set the flag, and kill the encoder so a blocked write ends at once."""
         self.cancel = True
-        p = self._proc
-        if p is not None and p.poll() is None:
-            try: p.kill()
-            except Exception: pass
+        with self._plock: ps = list(self._procs) + [self._proc]
+        for p in ps:
+            if p is not None and p.poll() is None:
+                try: p.kill()
+                except Exception: pass
+    def _thumb(self, fr, i, total):
+        """Keep a small copy of the frame that was just built (about 8 times a second) for the build preview in the Tasks window."""
+        now = time.monotonic()
+        if now - self._thumb_t < 0.12 or not CFG.get("show_build_preview", True): return
+        self._thumb_t = now
+        try:
+            h, w = fr.shape[:2]; tw = 360; self.thumb = (cv2.resize(fr, (tw, max(2, int(h * tw / float(w)))), interpolation=cv2.INTER_AREA), int(i), int(total))
+        except Exception: pass
     def run(self):
         self.state = "running"
         if self._task is not None: self._task.detail = ""; self._task.t0 = time.monotonic()
@@ -101,7 +116,7 @@ class ExportWorker(QThread):
                 if has_audio: cmd += ["-i", wav]
                 vcodec, hwenc, _note = codec_plan(fmt); _xp = CFG.get("export_preset", "fast")       # Settings > Export > Preset
                 if vcodec is None: raise RuntimeError(_note)
-                self._detail(_note)
+                self._detail(_note); _v0 = len(cmd)
                 cmd += ["-c:v", vcodec]
                 if fmt == "mov": cmd += ["-profile:v", "3"]
                 elif fmt == "webm": cmd += ["-b:v", "4M"]
@@ -109,16 +124,25 @@ class ExportWorker(QThread):
                 elif vcodec == "libsvtav1": cmd += ["-crf", str(crf), "-preset", SVT_PRESET.get(_xp, "8"), "-pix_fmt", "yuv420p"]
                 elif vcodec == "libaom-av1": cmd += ["-crf", str(crf), "-b:v", "0", "-cpu-used", AOM_CPU_USED.get(_xp, "6"), "-row-mt", "1", "-pix_fmt", "yuv420p"]
                 else: cmd += ["-crf", str(crf), "-preset", X264_PRESET.get(_xp, "veryfast"), "-pix_fmt", "yuv420p"]
-                if has_audio: cmd += ["-c:a", "libopus" if fmt == "webm" else "aac", "-b:a", "192k", "-shortest"]
-                cmd += ["-movflags", "+faststart"] if fmt in ("mp4", "mp4_265", "mkv", "av1") else []
+                vargs = cmd[_v0:]; aargs = ["-c:a", "libopus" if fmt == "webm" else "aac", "-b:a", "192k"]; tail = ["-movflags", "+faststart"] if fmt in ("mp4", "mp4_265", "mkv", "av1") else []
+                if has_audio: cmd += aargs + ["-shortest"]
+                cmd += tail
                 cmd += [out]
+                total_f = max(1, int(dur * fps))
+                running = len([j for j in EXPORTS.jobs if j.state == "running"])
+                nw = XP.worker_count(_render_threads(CFG.get("render_threads", 0)), running, bool(hwenc), total_f)
+                nw = _RAM.export_workers(nw, ow, oh, vcodec, X264_PRESET.get(_xp, "veryfast"), bool(hwenc))        # Patch 46: only as many pieces as fit under the RAM limit
+                if running > 1 and _RAM.limit_mb(): nw = max(1, nw // running)
+                if fmt in XP.SEG_EXT and nw >= 2:      # Patch 38: several pieces of the timeline are rendered at the same time
+                    return self._run_parallel(proj, wav, has_audio, vargs, aargs if has_audio else [], tail, hwenc, total_f, fps, ow, oh, nw, tmpd, out, fmt)
             if fmt != "png":
                 ef = open(errlog, "wb")      # the encoder's messages go to a file: a full pipe can never block it
                 proc = self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef, creationflags=NOWIN)
             try:                                    # Patch 36: OpenGL effects also work on the export thread (a real GPU only; software GL stays off)
                 from . import glfx as _glx; _glx.enable_current_thread(); _glx.set_export_mode(True)
             except Exception: pass
-            renderer = Renderer(MediaPool()); total = max(1, int(dur * fps))
+            _enter_export_thread()                  # Patch 46: the frame is composed on the GPU of this thread; small caches
+            renderer = Renderer(MediaPool(export=True)); renderer.export_mode = True; total = max(1, int(dur * fps))
             if self._task is not None: self._task.total = total
             # Patch 36: the frame is written to the encoder by a second thread, so rendering frame i+1 overlaps writing frame i
             # (before, the render waited for every write). A small queue keeps the memory low.
@@ -144,8 +168,9 @@ class ExportWorker(QThread):
                     if self.cancel or werr: break
                     fr = renderer.render(proj, i / fps, 1.0, fast=False)
                     if ow != proj.w or oh != proj.h: fr = letterbox(fr, ow, oh)
+                    self._thumb(fr, i, total)
                     if fmt == "png": wq.put(("png", i, (os.path.join(out, f"frame_{i:06d}.png"), fr)))
-                    elif proc and proc.stdin: wq.put(("raw", i, np.ascontiguousarray(fr).tobytes()))
+                    elif proc and proc.stdin: wq.put(("raw", i, memoryview(np.ascontiguousarray(fr)).cast("B")))        # no copy: the frame is new for every call
                     if i % 3 == 0:
                         self.progress.emit((i + 1) / total * 100)
                         if self._task is not None: self._task.done = i + 1
@@ -171,11 +196,70 @@ class ExportWorker(QThread):
             return False, str(ex)
         finally:
             self._proc = None
-            try:
-                from . import glfx as _glx; _glx.close_thread()
-            except Exception: pass
+            _leave_export_thread()
             if tmpd:
                 import shutil; shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def _enter_export_thread():
+    """Patch 46: this thread renders export frames: GPU composing on, Bone2D pictures are not cached, small caches."""
+    try:
+        from . import meshgl as _mg; _mg.enable_current_thread(); _mg.set_export_mode(True)
+    except Exception: pass
+    try:
+        from . import bone2d as _b2; _b2.set_export_thread(True)
+    except Exception: pass
+
+
+def _leave_export_thread():
+    try:
+        from . import glfx as _glx; _glx.close_thread()
+    except Exception: pass
+    try:
+        from . import meshgl as _mg; _mg.close_thread()
+    except Exception: pass
+    try:
+        from . import bone2d as _b2; _b2.set_export_thread(False)
+    except Exception: pass
+
+
+def _export_parallel(self, proj, wav, has_audio, vargs, aargs, tail, hwenc, total, fps, ow, oh, nw, tmpd, out, fmt):
+    """Render the timeline in pieces on `nw` threads (render/export_par.py), then join the pieces and add the sound. (Patch 38)"""
+    ext = XP.SEG_EXT[fmt]; t0 = time.monotonic(); last = [0.0]
+    def reg(proc, add):
+        with self._plock:
+            if add: self._procs.append(proc)
+            elif proc in self._procs: self._procs.remove(proc)
+    def make():
+        try:
+            from . import glfx as _glx; _glx.enable_current_thread(); _glx.set_export_mode(True)
+        except Exception: pass
+        _enter_export_thread()
+        rend = Renderer(MediaPool(export=True)); rend.export_mode = True
+        return Project.from_dict(copy.deepcopy(self.pd)), rend
+    def ended():
+        _leave_export_thread()
+    def frames(n, rate):
+        if self._task is not None: self._task.done = n
+        now = time.monotonic()
+        if now - last[0] > 0.25:
+            last[0] = now; self.progress.emit(n / float(total) * 100); self._detail("%d threads \u00b7 %.0f fps" % (nw, rate))
+    same = (ow == proj.w and oh == proj.h)
+    if self._task is not None: self._task.total = total
+    enc_thr = None if (hwenc or not str(vargs[1] if len(vargs) > 1 else "").startswith("lib")) else max(2, (os.cpu_count() or 4) // nw)
+    paths = XP.render_pieces(make, lambda p, r, t: r.render(p, t, 1.0, fast=False), (lambda f: f) if same else (lambda f: letterbox(f, ow, oh)), total, fps, ow, oh,
+                             vargs, ext, tmpd, nw, FFMPEG, lambda: self.cancel, frames, lambda f, i: self._thumb(f, i, total), reg, enc_thr, ended)
+    if paths is None or self.cancel: self._discard(fmt, out, []); return False, "Export cancelled"
+    self._detail("joining"); lst = os.path.join(tmpd, "pieces.txt"); XP.write_list(lst, paths)
+    log = os.path.join(tmpd, "join.log")
+    with open(log, "wb") as ef: self._proc = subprocess.Popen(XP.join_cmd(FFMPEG, lst, wav if has_audio else None, aargs, tail, out), stdout=subprocess.DEVNULL, stderr=ef, creationflags=NOWIN)
+    code = self._proc.wait()
+    if self.cancel: self._discard(fmt, out, []); return False, "Export cancelled"
+    if code: raise RuntimeError(open(log, "rb").read().decode(errors="replace")[-1800:] or "FFmpeg exited with code %d" % code)
+    self.progress.emit(100); return True, out
+
+
+ExportWorker._run_parallel = _export_parallel
 
 
 class ExportManager(QObject):

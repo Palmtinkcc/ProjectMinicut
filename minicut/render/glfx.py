@@ -29,6 +29,8 @@ import time
 
 import numpy as np
 
+from . import rprof as _rp            # Patch 47: frame stage profiler (not named P: glfx.run() uses P for a pass)
+
 try:
     import moderngl
 except Exception:                                    # not installed: GL effects are simply off
@@ -205,18 +207,19 @@ class _Engine:
     POOL_MAX = 40
 
     def __init__(self):
-        try:
-            self.ctx = moderngl.create_standalone_context()
-        except Exception:
-            if not os.name == "posix": raise
-            self.ctx = moderngl.create_standalone_context(backend="egl")        # Linux without a display (headless): EGL
+        from . import meshgl as _mg
+        self.ctx = _mg.acquire_context()            # Patch 46: one context per thread, shared with the mesh GPU renderer (reference counted)
+        self._shared = True
         info = self.ctx.info
         self.name = str(info.get("GL_RENDERER", "OpenGL"))
         low = self.name.lower()
-        if self.ctx.version_code < 330:
-            raise RuntimeError("OpenGL %.1f is too old (3.3 needed)" % (self.ctx.version_code / 100.0))
-        if any(w in low for w in ("gdi generic", "llvmpipe", "software", "swrast", "softpipe")) and not os.environ.get("MINICUT_GLFX_SOFT"):
-            raise RuntimeError("only software OpenGL is available (%s): the CPU effects are faster" % self.name)
+        try:
+            if self.ctx.version_code < 330:
+                raise RuntimeError("OpenGL %.1f is too old (3.3 needed)" % (self.ctx.version_code / 100.0))
+            if any(w in low for w in ("gdi generic", "llvmpipe", "software", "swrast", "softpipe")) and not os.environ.get("MINICUT_GLFX_SOFT"):
+                raise RuntimeError("only software OpenGL is available (%s): the CPU effects are faster" % self.name)
+        except Exception:
+            _mg.release_context(); raise
         self.vbo = self.ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32).tobytes())
         self.progs = {}                  # fragment source -> (program, vao)
         self.pool = {}                   # (w, h, comps) -> [free _Tex]
@@ -275,7 +278,7 @@ class _Engine:
     # -- a whole chain
     def run(self, img, groups, out_comps):
         h, w = img.shape[:2]; c = img.shape[2]
-        src = self.tex(w, h, c); src.tex.write(np.ascontiguousarray(img), alignment=1)
+        src = self.tex(w, h, c); _t = _rp.t0(); src.tex.write(np.ascontiguousarray(img), alignment=1); _rp.end("upload:glfx", _t, img.nbytes); _td = _rp.t0()
         main = src; used = [src]
         for passes in groups:
             targets = {"in": main, "main": main}; mine = []
@@ -288,11 +291,32 @@ class _Engine:
             for t in mine:
                 if t is not main: self.free(t)
             if targets["in"] is not src and targets["in"] is not main and targets["in"] not in mine: self.free(targets["in"])
+        _rp.end("draw:glfx", _td); _rp.count("glfx_runs")
         res = np.empty((h, w, out_comps), np.uint8)
-        self.fbo(main).read_into(res, components=out_comps, alignment=1)
+        _t = _rp.t0(); self.fbo(main).read_into(res, components=out_comps, alignment=1); _rp.end("readback:glfx", _t, res.nbytes)
         if main is not src: self.free(main)
         self.free(src)
         return res
+
+    def run_tex(self, src, groups, extra=None):
+        """The passes of `groups` on a picture that is already a texture (src: a _Tex that the caller owns; it is never pooled or freed here).
+        Returns the result as a _Tex taken from the pool: nothing is uploaded or read back. The caller frees it with free() when it has drawn it."""
+        w, h = src.w, src.h; main = src
+        for passes in groups:
+            targets = {"in": main, "main": main}; mine = []
+            if extra: targets.update(extra)                       # textures the caller owns (a mask), by name; never pooled or freed here
+            for P in passes:
+                ow, oh = P.size if P.size else (w, h)
+                o = self.tex(ow, oh, 4, P.dt); mine.append(o)
+                self.draw(P, targets, o)
+                targets[P.out] = o
+            nxt = targets["main"]
+            for t in mine:
+                if t is not nxt: self.free(t)
+            if targets["in"] is not src and targets["in"] is not nxt and targets["in"] not in mine: self.free(targets["in"])
+            main = nxt
+        _rp.count("glfx_gpu_runs")
+        return main
 
     # -- start-up check: the GPU result must equal a known answer, otherwise GL stays off
     def self_test(self):
@@ -310,7 +334,9 @@ class _Engine:
         return True, "ok"
 
     def close(self):
-        try: self.ctx.release()
+        try:
+            from . import meshgl as _mg
+            _mg.release_context()
         except Exception: pass
 
 
@@ -367,15 +393,20 @@ class Plan:
 def build_chain(img, items, ctx):
     """items: [(effect type, cleaned params)]. Returns a Plan for the leading items the library supports, or None when the first one is
     not supported (then the CPU does it). Needs no GL call: it only builds shader passes, so it is cheap."""
+    h, w = img.shape[:2]; c = img.shape[2]
+    return build_chain_shape(w, h, c, c == 3 or _alpha_opaque(img), items, ctx)
+
+
+def build_chain_shape(w, h, c, opaque, items, ctx):
+    """build_chain for a picture that is only described (size, channels, opaque or not): a picture that lives on the GPU (render core, step 3)."""
     from . import glfx_lib
     glfx_lib.load_fx()
-    h, w = img.shape[:2]; c = img.shape[2]
-    opaque = c == 3 or _alpha_opaque(img)
     groups = []; alpha = False
     for typ, p in items:
         b = glfx_lib.GL_FX.get(typ)
         built = b(p, ctx, w, h, opaque) if b is not None else None
         if built is None: break
+        if not opaque and typ in glfx_lib.LIGHT_TYPES: built = glfx_lib.light_wrap(built)          # a glow on a see-through picture
         groups.append(built.passes)
         if built.alpha: alpha = True; opaque = False
     if not groups: return None

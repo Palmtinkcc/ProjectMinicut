@@ -101,6 +101,10 @@ class PlaybackMixin:
     def request_render(self):
         if not self.proj or not hasattr(self, "viewport"): return
         q = self.settings["preview_quality"]
+        try:
+            from .. import degrade as _dg; _fq = _dg.forced_quality()          # Patch 58: while video memory is nearly full the preview is capped (the setting itself is untouched)
+            if _fq: q = min(q, _fq)
+        except Exception: pass
         if self.settings["fit_viewport"]:        # never draw more pixels than the preview shows
             # Cache display_scale so Qt layout is not recalculated on every playback tick.
             _now = time.monotonic()

@@ -19,14 +19,20 @@ from .workspace.actions import *
 from .project.autosave import *
 from .workspace.media_preview import *
 from .workspace.record_live import *
+from .workspace.bone2d_ui import Bone2DMixin
 
 
-class MainWindow(AutosaveMixin, MediaPreviewMixin, RecordMixin, ProjectMixin, WorkspaceMixin, PlaybackMixin, NodesMixin, QMainWindow):
+class MainWindow(Bone2DMixin, AutosaveMixin, MediaPreviewMixin, RecordMixin, ProjectMixin, WorkspaceMixin, PlaybackMixin, NodesMixin, QMainWindow):
     """Main window: owns the project, the renderer and the pages (home / workspace / node editor)."""
+    def _init_gl(self):
+        try:
+            from .render import bone2d_gl
+            bone2d_gl.init()
+        except Exception: pass
     def __init__(self):
         super().__init__(); self.setWindowTitle('MiniCut'); self.resize(1440,900); self.setMinimumSize(900,600)
-        self.settings=Settings(); CFG['frame_cache']=self.settings['frame_cache']; CFG['hw_decode']=self.settings['hw_decode']; CFG['bake']=self.settings['bake']; CFG['fx_adapt']=self.settings['fx_adapt']; CFG['export_preset']=self.settings['export_preset']; CFG['bake_max_gb']=self.settings['bake_max_gb']; CFG['encode_hw']=self.settings['encode_hw']; CFG['proxy_height']=self.settings['proxy_height']; CFG['proxy_quality']=self.settings['proxy_quality']; CFG['proxy_budget_gb']=self.settings['proxy_budget_gb']; self.proj=None; self.t=0.0; self.sel=None; self.snap_on=self.settings['snap']; self.playing=False; self._mprev=None; self._undo=[]; self._redo=[]; self._last_state=None; self._clip_copy=None
-        self.thumbs=ThumbStore(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self.audio=AudioPlayer(); self.timer=QTimer(self); self.timer.setInterval(self.frame_ms()); self.timer.timeout.connect(self.tick); self._last_tick=time.monotonic(); self.audio_seek_timer=QTimer(self); self.audio_seek_timer.setSingleShot(True); self.audio_seek_timer.setInterval(60); self.audio_seek_timer.timeout.connect(self._restart_audio_after_seek)
+        self.settings=Settings(); CFG['frame_cache']=self.settings['frame_cache']; CFG['hw_decode']=self.settings['hw_decode']; CFG['bake']=self.settings['bake']; CFG['fx_adapt']=self.settings['fx_adapt']; CFG['export_preset']=self.settings['export_preset']; CFG['show_build_preview']=self.settings['show_build_preview']; CFG['render_threads']=int(self.settings['render_threads']); CFG['bake_max_gb']=self.settings['bake_max_gb']; CFG['encode_hw']=self.settings['encode_hw']; CFG['proxy_height']=self.settings['proxy_height']; CFG['proxy_quality']=self.settings['proxy_quality']; CFG['proxy_budget_gb']=self.settings['proxy_budget_gb']; self.proj=None; self.t=0.0; self.sel=None; self.snap_on=self.settings['snap']; self.playing=False; self._mprev=None; self._undo=[]; self._redo=[]; self._last_state=None; self._clip_copy=None
+        self.thumbs=ThumbStore(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self.audio=AudioPlayer(); self.timer=QTimer(self); self.timer.setInterval(self.frame_ms()); self.timer.timeout.connect(self.tick); self._last_tick=time.monotonic(); self.audio_seek_timer=QTimer(self); self.audio_seek_timer.setSingleShot(True); self.audio_seek_timer.setInterval(60); self.audio_seek_timer.timeout.connect(self._restart_audio_after_seek); QTimer.singleShot(400, self._init_gl)
         EXPORTS.max_parallel=int(self.settings['export_parallel']); EXPORTS.job_finished.connect(self._on_export_finished)
         self.stack=QStackedWidget(); self.setCentralWidget(self.stack); self.home=QWidget(); self.stack.addWidget(self.home); self._build_home(); self.editor=QWidget(); self.stack.addWidget(self.editor); self.apply_shortcuts(); self.show_home(); self.autosave_apply()
     @staticmethod
@@ -141,6 +147,12 @@ def main():
     app=QApplication(sys.argv); app.setApplicationName('MiniCut'); app.setStyle('Fusion'); app.setStyleSheet(QSS)
     ico = app_icon(); app.setWindowIcon(ico)
     win=MainWindow(); win.setWindowIcon(ico); apply_ui(win); win.restore_layout(); install_progress(win); install_gpu_surface()
+    try:                                                   # Patch 57: every error goes through one hub: crash.log, a pop-up, a circuit breaker
+        from . import errors as _errors, crashlog as _cl
+        from .shared import error_popup as _ep
+        _errors.install_hooks(); _errors.HUB.add_sink(_cl.log_error_event); _ep.install(win)
+        from .shared import degrade_qt as _dq; _dq.install(win)                 # Patch 58: the ladder (low preview -> CPU) when video memory keeps running out
+    except Exception as ex: print("error pop-up init failed", ex)
     # apply_perf applies the saved compositing mode using the Settings mapping API.
     # Do not call Settings.get(): this Settings class supports __getitem__, not dict.get.
     apply_perf(win.settings, win.renderer)
@@ -151,6 +163,9 @@ def main():
     try:
         from . import paintguard; paintguard.install()
     except Exception: pass
+    try:
+        from . import touch; touch.install(app)       # touch screen: pinch zoom, two-finger pan, long press = menu
+    except Exception as ex: print("touch init failed", ex)
     win.show(); sys.exit(app.exec())
 
 

@@ -699,7 +699,7 @@ class VideoSource:
             try: os.utime(self.dir)                      # used now: keep it longest in the disk budget
             except OSError: pass
         self.index = []; self._starts = []; self._index_mt = None
-        self.pieces = OrderedDict(); self.cache = OrderedDict(); self.rawc = OrderedDict()
+        self.pieces = OrderedDict(); self.cache = OrderedDict(); self.rawc = OrderedDict(); self.cache_limit = 0; self.raw_keep = 4      # Patch 46: an export keeps 2 pictures, not 24
         self.path = path; self._warm = None; self._spare = None; self._warm_busy = False; self._wlock = threading.Lock()      # Patch 54: see prewarm()
     def _refresh_index(self):
         if self.dir is None: return
@@ -783,7 +783,7 @@ class VideoSource:
             raw = self.orig.read(idx)
         if raw is None: raw = np.zeros((max(1, self.h), max(1, self.w), 3), np.uint8)
         self.rawc[key] = raw
-        while len(self.rawc) > 4: self.rawc.popitem(last=False)  # keep more decoded frames to reduce re-decodes on scrub
+        while len(self.rawc) > self.raw_keep: self.rawc.popitem(last=False)  # keep more decoded frames to reduce re-decodes on scrub
         return raw
     def frame(self, t, ds=1.0):
         t = max(0.0, t); idx = int(t * self.fps + 1e-6)
@@ -797,7 +797,7 @@ class VideoSource:
             raw = cv2.resize(raw, (tw, th), interpolation=cv2.INTER_AREA if tw < raw.shape[1] else cv2.INTER_LINEAR)
         img = cv2.cvtColor(raw, cv2.COLOR_BGR2BGRA)
         self.cache[key] = img
-        while len(self.cache) > CFG["frame_cache"]: self.cache.popitem(last=False)
+        while len(self.cache) > (self.cache_limit or CFG["frame_cache"]): self.cache.popitem(last=False)
         return img
     def frame_bgr(self, t, ds=1.0):
         """Like frame() but 3-channel BGR (no alpha plane): what the effects use for video (Patch 34)."""
@@ -814,7 +814,7 @@ class VideoSource:
         elif raw.shape[1] != tw or raw.shape[0] != th:
             raw = cv2.resize(raw, (tw, th), interpolation=cv2.INTER_AREA if tw < raw.shape[1] else cv2.INTER_LINEAR)
         self.cache[key] = raw
-        while len(self.cache) > CFG["frame_cache"]: self.cache.popitem(last=False)
+        while len(self.cache) > (self.cache_limit or CFG["frame_cache"]): self.cache.popitem(last=False)
         return raw
     def close(self):
         for r in self.pieces.values(): r.release()
@@ -875,19 +875,24 @@ def proxy_sources(clips, off=0.0, out=None):
 
 
 class MediaPool:
-    def __init__(self, use_proxy=False): self.src = {}; self.make_compound = None; self.use_proxy = use_proxy; self._proxy_jobs = set()
+    def __init__(self, use_proxy=False, export=False):
+        self.src = {}; self.make_compound = None; self.use_proxy = use_proxy; self._proxy_jobs = set()
+        self.export = export          # Patch 46: the pool of an export thread: small frame caches (every frame is asked for once, in order)
     MAX_OPEN = 16          # open video files at most (the oldest one is closed first): keeps a long project light
     def _evict(self):
-        while len(self.src) >= self.MAX_OPEN:
+        while len(self.src) >= (8 if self.export else self.MAX_OPEN):       # an export reads the timeline in order: files it is done with are closed early (a decoder holds tens of MB)
             s = self.src.pop(next(iter(self.src)))
             try:
                 if hasattr(s, "close"): s.close()
             except Exception: pass
     def _video(self, p):
         self._evict()
-        if not self.use_proxy: return VideoSource(p)
-        PROXY.pool = self; PROXY.want(p)
-        return VideoSource(p, use_proxy=True)
+        if not self.use_proxy: v = VideoSource(p)
+        else:
+            PROXY.pool = self; PROXY.want(p)
+            v = VideoSource(p, use_proxy=True)
+        if self.export: v.cache_limit = 2; v.raw_keep = 2
+        return v
     def prepare(self, clips, t=0.0):
         """Queue the proxies of every video in the project (also inside compound clips); the ones nearest the playhead first."""
         if not self.use_proxy: return
@@ -907,6 +912,10 @@ class MediaPool:
         self.src.clear()
     def get(self, c):
         if c.get("kind") == "compound": return self.make_compound(c) if self.make_compound else None
+        if c.get("kind") == "bone2d":
+            from .bone2d import cached_rig
+            rs = cached_rig(c.get("path") or "")
+            return rs.view(c.get("b2d")) if rs is not None else None
         p = c["path"]
         if c.get("effects"):
             from .smartkey import sk_path
@@ -1008,6 +1017,9 @@ def make_thumb(path, kind, t, h):
         if img is None:                                  # Patch 48: OpenCV could not read it (an unusual PNG ...): try Pillow
             try: im = Image.open(path); im.load(); img = cv2.cvtColor(np.array(im.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
             except Exception: img = None
+    elif kind == "bone2d":
+        from .bone2d import thumb_image
+        img = thumb_image(path, h)
     elif kind == "gif":
         im = Image.open(path); im.seek(0); img = cv2.cvtColor(np.array(im.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
     if img is None: return None

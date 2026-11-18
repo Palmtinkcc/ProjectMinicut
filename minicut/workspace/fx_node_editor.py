@@ -302,6 +302,11 @@ class FxView(QGraphicsView):
         pts = [QPointF(x, y) for x in range(x0, int(rect.right()) + g, g) for y in range(y0, int(rect.bottom()) + g, g)]
         p.drawPoints(QPolygonF(pts))
 
+    touch_ok = True; touch_menu = True                                  # Touch: pinch = zoom, two fingers = pan, long press = menu
+    def touch_pinch(self, f, pos):
+        from ..touch import view_pinch; view_pinch(self, f, pos)
+    def touch_pan(self, dx, dy):
+        from ..touch import view_pan; view_pan(self, dx, dy)
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15; cur = self.transform().m11()
         if 0.25 <= cur * f <= 2.5: self.scale(f, f)
@@ -457,6 +462,11 @@ class FxPreviewWidget(QWidget):
         r = QRectF((self.width() - w) / 2 + self.pan.x(), (self.height() - h) / 2 + self.pan.y(), w, h)
         p.drawTiledPixmap(r.toRect(), self._chess); p.setRenderHint(QPainter.SmoothPixmapTransform, True); p.drawImage(r, self.img)
         if self.note: p.setPen(QColor("#ff9b9b")); p.drawText(self.rect().adjusted(8, 0, -8, -6), Qt.AlignBottom | Qt.AlignLeft, self.note)
+    touch_ok = True
+    def touch_pinch(self, f, pos):
+        old = self.cur_scale(); new = max(0.1, min(8.0, old * f)); self.zoom = new
+        c = QPointF(self.width() / 2, self.height() / 2) + self.pan; self.pan = self.pan + (c - pos) * (new / old - 1); self.update()
+    def touch_pan(self, dx, dy): self.pan = self.pan + QPointF(dx, dy); self.update()
     def wheelEvent(self, e): self.set_zoom(self.cur_scale() * (1.15 if e.angleDelta().y() > 0 else 1 / 1.15))
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton: self._drag = e.position(); self.setCursor(Qt.ClosedHandCursor)

@@ -627,6 +627,9 @@ class GpuState:
         try:                                  # Patch 35: the OpenGL effect chains get a fresh try as well
             from . import glfx; glfx.reset()
         except Exception: pass
+        try:                                  # Patch 46: and the mesh GPU renderer (it is the one that draws the frame when it works)
+            from . import meshgl; meshgl.reset()
+        except Exception: pass
         self.reset_requested = True
         self.status          = "testing ..."
 

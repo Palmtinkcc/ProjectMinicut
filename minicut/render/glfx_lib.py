@@ -208,6 +208,33 @@ void main() { vec3 acc = vec3(0.0); float ws = 0.0;
   o = vec4(acc / ws, 1.0); }""")
 _COPY = _fs("void main() { o = texture(u_in, v_uv); }")
 
+# ── see-through pictures (render core, step 3b): the CPU functions work on premultiplied pixels there (blurs) or over black (glows); these passes do the same
+_PREM = _fs("void main() { vec4 c = texture(u_in, v_uv); o = vec4(c.rgb * c.a, c.a); }")
+_UNPREM = _fs("void main() { vec4 c = texture(u_in, v_uv); o = c.a > 0.0 ? vec4(min(c.rgb / c.a, vec3(1.0)), c.a) : vec4(0.0); }")
+_OVERBLACK = _fs("void main() { vec4 c = texture(u_in, v_uv); o = vec4(c.rgb * c.a, 1.0); }")
+_LIGHT_FIN = _fs("""uniform sampler2D u_orig;
+void main() { float a = texture(u_orig, v_uv).a; vec3 g = texture(u_in, v_uv).rgb; float al = max(a, max(g.r, max(g.g, g.b)));
+  o = al > 0.0 ? vec4(g / al, al) : vec4(0.0); }""")
+_BLUR1D4 = _fs("""uniform vec2 u_dir; uniform float u_sig; uniform int u_r;
+void main() { vec4 acc = vec4(0.0); float ws = 0.0;
+  for (int i = -u_r; i <= u_r; i++) { float wt = exp(-0.5 * float(i * i) / (u_sig * u_sig)); acc += texture(u_in, v_uv + u_dir * float(i)) * wt; ws += wt; }
+  o = acc / ws; }""")
+_MASKPASS = _fs("""uniform sampler2D u_mask;
+void main() { vec4 c = texture(u_in, v_uv); o = vec4(c.rgb, c.a * texture(u_mask, v_uv).r); }""")      # the clip's mask (0..1 in the red channel) times the alpha
+MASK_NAME = "mk"
+LIGHT_TYPES = frozenset({"glow", "soft_glow"})          # the glows: "light is new picture, so it has to show where the media is see-through too"
+
+
+def light_wrap(built):
+    """A glow on a see-through picture, like effects._run_fx: the glow works on the colours over black (an opaque picture); what it adds is new picture, so
+    the alpha becomes the larger of the old alpha and the brightest channel, and the colours are divided by it."""
+    if not built.passes: return built
+    ps = [Pass(_OVERBLACK, {}, {"u_in": "in"}, "ob")]
+    for P in built.passes:
+        ps.append(Pass(P.frag, dict(P.u), {k: ("ob" if v == "in" else v) for k, v in P.tex.items()}, "gl" if P.out == "main" else P.out, P.size, P.dt))
+    ps.append(Pass(_LIGHT_FIN, {}, {"u_in": "gl", "u_orig": "in"}, "main"))
+    return Built(ps, alpha=True)
+
 
 def _down_frag(post=""):
     return _fs(_DOWN.replace("//POST", post))
@@ -226,7 +253,7 @@ def _shrink(s):
     return 1 if s < 3.0 else int(min(8, max(2, s / 1.5)))
 
 
-def gauss_chain(w, h, sx, sy, src="in", prefix="g", shrink=True):
+def gauss_chain(w, h, sx, sy, src="in", prefix="g", shrink=True, rgba=False):
     """Passes of a Gaussian blur of sigma (sx, sy) like fastfx.gauss_u8. Returns (passes, target of the result, its size).
     The result may be smaller than the picture (the consumer reads it with linear filtering = the resize back up)."""
     passes = []; cur = src; cw, ch = w, h
@@ -240,7 +267,7 @@ def gauss_chain(w, h, sx, sy, src="in", prefix="g", shrink=True):
     for axis, s in ((0, tx), (1, ty)):
         if s < 0.3: continue
         name = "%s%d" % (prefix, axis)
-        passes.append(Pass(_BLUR1D, {"u_dir": (1.0 / cw, 0.0) if axis == 0 else (0.0, 1.0 / ch), "u_sig": float(s), "u_r": max(1, min(31, int(s * 3)))},
+        passes.append(Pass(_BLUR1D4 if rgba else _BLUR1D, {"u_dir": (1.0 / cw, 0.0) if axis == 0 else (0.0, 1.0 / ch), "u_sig": float(s), "u_r": max(1, min(31, int(s * 3)))},
                            {"u_in": cur}, name, (cw, ch)))
         cur = name
     return passes, cur, (cw, ch)
@@ -251,8 +278,10 @@ def b_blur(p, c, w, h, opaque):
     if amt < 0.3: return Built([])
     sx = amt * p["x_blur"] / 100.0; sy = amt * p["y_blur"] / 100.0
     if sx < 0.3 and sy < 0.3: return Built([])
-    if not opaque: return None                                   # transparent edges need premultiplied pixels: the CPU function does that
     if abs(sx - sy) < 0.5: sy = sx
+    if not opaque:                                               # transparent edges need premultiplied pixels: premultiply, blur all four channels, undo
+        passes = [Pass(_PREM, {}, {"u_in": "in"}, "pm")]; chain, cur, _ = gauss_chain(w, h, sx, sy, src="pm", rgba=True)
+        return Built(passes + chain + [Pass(_UNPREM, {}, {"u_in": cur}, "main")], alpha=True)
     passes, cur, (cw, ch) = gauss_chain(w, h, sx, sy)
     if (cw, ch) == (w, h): passes[-1].out = "main"
     else: passes.append(Pass(_COPY, {}, {"u_in": cur}, "main"))
@@ -269,18 +298,27 @@ void main() { vec3 acc = vec3(0.0); float cov = 0.0;
   o = vec4(acc / float(u_n), cov / float(u_n)); }""")
 
 
+_MBLUR4 = _fs("""uniform vec2 u_step; uniform int u_n; uniform float u_t0;
+void main() { vec4 acc = vec4(0.0);
+  for (int i = 0; i < u_n; i++) {
+    vec2 uv = v_uv + u_step * (u_t0 + float(i));
+    if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) acc += texture(u_in, uv);
+  }
+  o = acc / float(u_n); }""")
+
+
 def b_motion_blur(p, c, w, h, opaque):
     n = int(p["length"] * c.k)
     if n < 2: return Built([])
-    if not opaque: return None
     n = min(n, max(h, w) // 2); bidir = bool(p.get("bidirectional", False)); a = math.radians(p["angle"])
     sc = max(1.0, n / 9.0); sw, sh = (max(1, int(w / sc)), max(1, int(h / sc))) if sc > 1 else (w, h)
     m = max(3, int(round(n / sc))) | 1
     taps, t0 = (m, -(m // 2)) if bidir else (m // 2 + 1, 0)
     passes = []; src = "in"
-    if sc > 1: passes.append(down_pass("in", w, h, sw, sh, "md")); src = "md"
-    passes.append(Pass(_MBLUR, {"u_step": (math.cos(a) / sw, math.sin(a) / sh), "u_n": min(taps, 64), "u_t0": float(t0)}, {"u_in": src}, "mb", (sw, sh)))
-    passes.append(Pass(_COPY, {}, {"u_in": "mb"}, "main"))
+    if not opaque: passes.append(Pass(_PREM, {}, {"u_in": "in"}, "pm")); src = "pm"            # see-through: blur the premultiplied pixels (samples outside add nothing)
+    if sc > 1: passes.append(down_pass(src, w, h, sw, sh, "md")); src = "md"
+    passes.append(Pass(_MBLUR if opaque else _MBLUR4, {"u_step": (math.cos(a) / sw, math.sin(a) / sh), "u_n": min(taps, 64), "u_t0": float(t0)}, {"u_in": src}, "mb", (sw, sh)))
+    passes.append(Pass(_COPY if opaque else _UNPREM, {}, {"u_in": "mb"}, "main"))
     return Built(passes, alpha=True)
 
 
@@ -297,38 +335,51 @@ void main() { vec3 acc = vec3(0.0); float cov = 0.0;
   o = vec4(acc / float(u_n), u_mode == 1 ? cov / float(u_n) : 1.0); }""")
 
 
+_RADIAL4 = _fs("""uniform int u_mode, u_n; uniform float u_zam, u_amax; uniform vec2 u_c;
+void main() { vec4 acc = vec4(0.0);
+  for (int i = 0; i < u_n; i++) {
+    float t = float(i) / float(max(u_n - 1, 1)); vec2 q;
+    t -= 0.5;
+    if (u_mode == 0) { q = u_c + (v_uv - u_c) / (1.0 + u_zam * t); }
+    else { float a = u_amax * t, cs = cos(a), sn = sin(a); vec2 d = (v_uv - u_c) * u_size; q = u_c + vec2(cs * d.x + sn * d.y, -sn * d.x + cs * d.y) / u_size; }
+    bool inb = (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0);
+    if (u_mode == 0) acc += texture(u_in, clamp(q, 0.0, 1.0)); else if (inb) acc += texture(u_in, q);
+  }
+  o = acc / float(u_n); }""")
+
+
 def _steps(disp, fast):
     return int(max(4, min(10 if fast else 14, disp * 0.5 + 2)))
 
 
-def _radial(w, h, c, mode, zam, amax, cx, cy, disp_fn):
+def _radial(w, h, c, mode, zam, amax, cx, cy, disp_fn, opaque=True):
     sc = 2 if min(w, h) >= 240 else 1                  # the CPU version counts its steps on a half-size picture: same count here
     n = _steps(disp_fn(max(1, w // sc), max(1, h // sc)), c.fast)
-    return Built([Pass(_RADIAL, {"u_mode": mode, "u_n": n, "u_zam": float(zam), "u_amax": float(amax), "u_c": (cx, cy)})], alpha=(mode == 1))
+    u = {"u_mode": mode, "u_n": n, "u_zam": float(zam), "u_amax": float(amax), "u_c": (cx, cy)}
+    if not opaque:                                                      # see-through: premultiply, average the samples of all four channels, undo
+        return Built([Pass(_PREM, {}, {"u_in": "in"}, "pm"), Pass(_RADIAL4, u, {"u_in": "pm"}, "rb"), Pass(_UNPREM, {}, {"u_in": "rb"}, "main")], alpha=True)
+    return Built([Pass(_RADIAL, u)], alpha=(mode == 1))
 
 
 def b_radial_blur(p, c, w, h, opaque):
     amt = p["amount"] / 100.0
     if amt <= 0.002: return Built([])
-    if not opaque: return None
     spin = p.get("mode", "zoom") == "spin"; cx, cy = p["cx"] / 100.0, p["cy"] / 100.0
-    if spin: return _radial(w, h, c, 1, 0, amt * 0.3, cx, cy, lambda a, b: amt * 0.3 * math.hypot(a, b) / 2)
-    return _radial(w, h, c, 0, amt * 0.25, 0, cx, cy, lambda a, b: amt * 0.25 * max(a, b) / 2)
+    if spin: return _radial(w, h, c, 1, 0, amt * 0.3, cx, cy, lambda a, b: amt * 0.3 * math.hypot(a, b) / 2, opaque)
+    return _radial(w, h, c, 0, amt * 0.25, 0, cx, cy, lambda a, b: amt * 0.25 * max(a, b) / 2, opaque)
 
 
 def b_zoom_blur(p, c, w, h, opaque):
     amt = p["amount"] / 100.0
     if amt <= 0.001: return Built([])
-    if not opaque: return None
-    return _radial(w, h, c, 0, amt * 0.5, 0, p.get("cx", 50.0) / 100.0, p.get("cy", 50.0) / 100.0, lambda a, b: amt * 0.5 * max(a, b) / 2)
+    return _radial(w, h, c, 0, amt * 0.5, 0, p.get("cx", 50.0) / 100.0, p.get("cy", 50.0) / 100.0, lambda a, b: amt * 0.5 * max(a, b) / 2, opaque)
 
 
 def b_spin_blur(p, c, w, h, opaque):
     ang = p["angle"]
     if abs(ang) < 0.1: return Built([])
-    if not opaque: return None
     return _radial(w, h, c, 1, 0, math.radians(ang), p.get("cx", 50.0) / 100.0, p.get("cy", 50.0) / 100.0,
-                   lambda a, b: abs(math.radians(ang)) * math.hypot(a, b) / 2)
+                   lambda a, b: abs(math.radians(ang)) * math.hypot(a, b) / 2, opaque)
 
 
 # ───────────────────────── distort ─────────────────────────

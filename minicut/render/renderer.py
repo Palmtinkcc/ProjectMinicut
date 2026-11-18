@@ -6,6 +6,12 @@ from .nodegraph import *
 from .effects import apply_effects, clip_spills, time_used
 from .fastcomp import blend_into, blend_mode, visible_rect, resize_part, covers_canvas, to_cv_matrix
 from .gpu import GPU
+from . import meshgl as _meshgl
+from . import ramgov as _ramgov
+from . import effects as _EFX
+try: from . import glfx as _GFX                      # render core, step 3: effects on the GPU (None when OpenGL is not there)
+except Exception: _GFX = None
+from . import rprof as _rp                  # Patch 47: frame stage profiler (off unless MINICUT_RPROF=1)
 from .perf import lower_thread_priority
 
 
@@ -14,6 +20,7 @@ _text_cache = OrderedDict()
 
 def _mc37_composite_path(path, reason=None):
     """Log only path transitions, so diagnostics reveal the actual compositor without flooding the log."""
+    _rp.note("path", path)
     try:
         prev = getattr(_TLS, "_mc37_composite_path", None)
         key = (path, reason)
@@ -205,7 +212,7 @@ def origin_shift(c, bw, bh, sx, sy, rot):
 
 class Renderer:
     def __init__(self, pool):
-        self.pool = pool; self.lut_cache = {}; self.version = 0   # bumped on every project change (see clear_preview_cache)
+        self.pool = pool; self.lut_cache = {}; self.version = 0; _ramgov.register(self)   # bumped on every project change (see clear_preview_cache)
         # Rendered frames are kept for repeated scrubbing; the limit is in bytes (Settings -> Preview RAM cache).
         self.preview_cache = OrderedDict(); self.preview_cache_bytes = 300e6; self._pc_bytes = 0
         self._fx_cache = OrderedDict(); self._fx_bytes = 0; self._fx_lock = threading.Lock(); self._fx_still = {}      # _fx_still: (clip, effects) -> True when that stack gives the same picture at every moment
@@ -272,6 +279,7 @@ class Renderer:
                 threading.Thread(target=op, name="MiniCutPreOpen", daemon=True).start()
             elif hasattr(src, "prewarm"): src.prewarm(int(first * fps + 1e-6))
     def render_cached(self, proj, t, q, fast=False, ver=None, fp=None):
+        _ramgov.check()                                            # Patch 46: above the RAM limit -> the caches are trimmed (read once a second)
         if self.live_play and getattr(_TLS, "preview", False):
             try: self._preroll(proj, t)
             except Exception: pass
@@ -353,10 +361,12 @@ class Renderer:
         return plans
 
     # ---------------------------------------------------------------- the clip's picture
-    def _layer_image(self, p, q, fast, gpu=False, bg=None):
+    def _layer_image(self, p, q, fast, gpu=False, bg=None, mesh=None):
         """(picture, opaque). The picture is BGR when it is fully opaque, otherwise BGRA. Video without effects is used as it
         comes from the decoder (no resize, no copy); the one resize happens when the layer is placed.
-        bg: BGR canvas snapshot of layers beneath this one (for copy_background effect)."""
+        bg: BGR canvas snapshot of layers beneath this one (for copy_background effect).
+        mesh: the GPU engine (meshgl) when the frame is composed on the GPU: a video frame is then handed over as it is (the GPU scales it) and
+        a Bone2D clip without effects comes back as a MeshJob, drawn by the GPU straight into the frame."""
         c = p["c"]; kind = c["kind"]; lt = p["lt"]; has_fx = bool(c.get("effects")) or clip_has_mask(c)
         if kind == "text":
             img = render_text(c, min(4.0, max(0.1, math.ceil(q * p["ms"] * 4) / 4)))
@@ -364,9 +374,22 @@ class Renderer:
             src = self.pool.get(c)
             if not src: return None, False
             alpha_src = getattr(src, "has_alpha", False)          # a Better Chroma Key render: colour + matte, never the opaque shortcuts
-            if kind == "video" and not has_fx and not gpu and not alpha_src: return src.raw_frame(src_time(c, lt)), True
+            if kind == "video" and not has_fx and (mesh is not None or not gpu) and not alpha_src: return src.raw_frame(src_time(c, lt)), True
             ds = min(1.0, max(0.125, math.ceil(p["bw"] * q * p["ms"] / src.w * 4) / 4))
             ts = src_time(c, lt) if kind != "image" else 0
+            fxi = self._gpu_fx_items(c, lt, None) if (mesh is not None and has_fx and kind in ("bone2d", "compound")) else None          # decided before the picture is made
+            if mesh is not None and kind == "bone2d" and (not has_fx or fxi is not None) and hasattr(src, "gpu_job"):
+                job = src.gpu_job(ts, ds)
+                if job is not None:
+                    if not has_fx: return job, False
+                    fj = self._gpu_fx_job(c, p, job, fast, mesh, fxi)
+                    if fj is not None: return fj, False
+            if mesh is not None and kind == "compound" and (not has_fx or fxi is not None) and hasattr(src, "proj"):
+                job = self._compound_job(src, ts, ds, mesh)
+                if job is not None:
+                    if not has_fx: return job, False
+                    fj = self._gpu_fx_job(c, p, job, fast, mesh, fxi)
+                    if fj is not None: return fj, False
             if not has_fx and not gpu:
                 if kind == "compound": return src.frame_auto(ts, ds)
                 if kind == "image" and getattr(src, "opaque", False): return src.frame_bgr(ds), True
@@ -375,11 +398,16 @@ class Renderer:
                 if s < 0.999: ds = max(0.125, math.floor(ds * s * 8) / 8.0)       # Patch 40: the effect runs on fewer pixels, the placement scales it up
             img = src.frame_bgr(ts, ds) if (kind == "video" and has_fx and not alpha_src and not clip_has_mask(c) and not clip_spills(c) and hasattr(src, "frame_bgr")) else src.frame(ts, ds)      # Patch 34: effects work on 3 channels when they can
         if has_fx:
+            if mesh is not None and isinstance(img, np.ndarray):          # a picture with effects: the effects run on the GPU when all of them can
+                fj = self._gpu_fx_job(c, p, img, fast, mesh)
+                if fj is not None: return fj, False
             if clip_spills(c):
                 big, inner = self._pad_for_spill(p, img)
                 return self._effects_cached(c, big, p, fast, inner, bg=bg), False
             img = self._effects_cached(c, img, p, fast, bg=bg)
         return img, False
+    FX_BYTES = 200e6          # budget of the effect-picture cache of one preview renderer (render/ramgov.py)
+    export_mode = False       # True on the renderers of an export: small caches (nothing is drawn twice)
     live_play = False         # True while the preview plays or a slider moves (set by the app); the export renderer never sets it
     @staticmethod
     def _spill_pad(p, iw, ih, ratio=False):
@@ -439,13 +467,13 @@ class Renderer:
             sig = json.dumps([c.get("effects"), c.get("mask"), c.get("mask_shape"), c.get("mask_feather"), c.get("mask_layers"),
                               (c.get("text"), c.get("font"), c.get("fsize"), c.get("tcolor"), c.get("stroke"), c.get("scolor"), c.get("bold")) if c["kind"] == "text" else None],
                              sort_keys=True, default=str)
-            moving = c["kind"] in ("video", "gif")                       # the media itself changes with time
+            moving = c["kind"] in ("video", "gif", "bone2d")                       # the media itself changes with time
             static_id = (c["id"], sig); still = self._fx_still.get(static_id, False) and not moving
             key = (c["id"], c.get("path"), round(src_time(c, lt), 4) if moving else None, None if still else round(lt, 4), sig, img.shape, bool(fast), inner)
             with self._fx_lock:
                 hit = self._fx_cache.get(key)
-                if hit is not None: self._fx_cache.move_to_end(key); return hit
-            t0 = time.perf_counter(); out = self.apply_color(c, img, k=k, lt=lt, fast=fast, inner=inner, bg=None)
+                if hit is not None: self._fx_cache.move_to_end(key); _rp.count("fx_cache_hit"); return hit
+            t0 = time.perf_counter(); _t = _rp.t0(); out = self.apply_color(c, img, k=k, lt=lt, fast=fast, inner=inner, bg=None); _rp.end("fx:" + c["kind"], _t); _rp.count("fx_computed")
             if self.live_play and getattr(_TLS, "preview", False): self._fx_note(c["id"], (time.perf_counter() - t0) * 1000.0)
             if out is not None:
                 if not moving and not time_used():                      # learned from this run: the picture is the same at every moment
@@ -453,11 +481,12 @@ class Renderer:
                     self._fx_still[static_id] = True; key = key[:3] + (None,) + key[4:]
                 with self._fx_lock:
                     self._fx_cache[key] = out; self._fx_bytes += out.nbytes
-                    while (len(self._fx_cache) > 32 or self._fx_bytes > 200e6) and len(self._fx_cache) > 1:
+                    lim_n, lim_b = (3, 40e6) if self.export_mode else (32, Renderer.FX_BYTES)          # Patch 46: an export never draws the same effect picture twice
+                    while (len(self._fx_cache) > lim_n or self._fx_bytes > lim_b) and len(self._fx_cache) > 1:
                         self._fx_bytes -= self._fx_cache.popitem(last=False)[1].nbytes
             return out
         # copy_background: bg changes every frame, skip cache entirely
-        t0 = time.perf_counter(); out = self.apply_color(c, img, k=k, lt=lt, fast=fast, inner=inner, bg=bg)
+        t0 = time.perf_counter(); _t = _rp.t0(); out = self.apply_color(c, img, k=k, lt=lt, fast=fast, inner=inner, bg=bg); _rp.end("fx:" + c["kind"], _t); _rp.count("fx_computed")
         if self.live_play and getattr(_TLS, "preview", False): self._fx_note(c["id"], (time.perf_counter() - t0) * 1000.0)
         return out
     @staticmethod
@@ -523,24 +552,41 @@ class Renderer:
 
     # ---------------------------------------------------------------- one frame
     def render(self, proj, t, q, fast=False):
-        depth = getattr(_TLS, "depth", 0); _TLS.depth = depth + 1
+        depth = getattr(_TLS, "depth", 0); _TLS.depth = depth + 1; _pf = _rp.frame_begin() if depth == 0 else 0.0
         try: return self._render(proj, t, q, fast, depth)
-        finally: _TLS.depth = depth
+        finally: _TLS.depth = depth; _rp.frame_end(_pf)
     def _render(self, proj, t, q, fast, depth):
         W, H = max(2, int(round(proj.w * q))), max(2, int(round(proj.h * q)))
         bg = QColor(proj.bg); bgr = (bg.blue(), bg.green(), bg.red())
-        plans = self._plans(proj, t, q, W, H)
-        gpu = GPU if (depth == 0 and getattr(_TLS, "preview", False) and plans) else None
+        _t = _rp.t0(); plans = self._plans(proj, t, q, W, H); _rp.end("plan", _t); _rp.count("plans", len(plans))
+        E = None
+        if depth == 0 and plans:                                  # Patch 46: the whole frame on the GPU (preview and export threads), Bone2D as GPU meshes
+            try: E = _meshgl.engine()
+            except Exception: E = None
+        if E is not None:
+            if all(p["c"].get("blend", "normal") in _meshgl.BLEND_IDS and not any(e.get("type") == "copy_background" and e.get("on", True) for e in (p["c"].get("effects") or [])) for p in plans):
+                try:
+                    layers = self._gpu_layers(plans, q, fast, E)
+                    out = E.composite(layers, W, H, bgr)
+                    _mc37_composite_path("meshgl", "mesh GPU renderer active (Patch 46)")
+                    return out
+                except Exception as ex:
+                    try: from .. import errors as _errors; _errors.report("gpu.composite", ex)
+                    except Exception: pass
+                    _meshgl.fail("drawing failed: %s" % (ex,)); _mc37_composite_path("cpu", "mesh GPU renderer failed; fallback")
+            else:
+                _mc37_composite_path("cpu", "blend mode unsupported by the GPU renderer")
+        gpu = GPU if (depth == 0 and getattr(_TLS, "preview", False) and plans and E is None) else None
         if gpu is not None and all(p["c"].get("blend", "normal") == "normal" and not any(e.get("type") == "copy_background" and e.get("on", True) for e in (p["c"].get("effects") or [])) for p in plans):
             try:
                 if gpu.usable():
                     layers = []
                     for p in plans:
                         try:
-                            img, _ = self._layer_image(p, q, fast, gpu=True)
+                            _t = _rp.t0(); img, _ = self._layer_image(p, q, fast, gpu=True); _rp.end("layer:" + p["c"]["kind"], _t)
                             if img is not None: layers.append((img, self._matrix(p, q, img.shape[1], img.shape[0]), p["op"]))
                         except Exception as ex: print("composite error:", ex)
-                    out = gpu.draw(layers, W, H, bgr)
+                    _t = _rp.t0(); out = gpu.draw(layers, W, H, bgr); _rp.end("qt_gpu:draw", _t)
                     _mc37_composite_path("gpu", "OpenGL+GLSL compositing active (Patch 33)")
                     return out
                 _mc37_composite_path("cpu", gpu.status or "GPU unavailable")
@@ -557,9 +603,94 @@ class Renderer:
                 # can read the composited pixels of all layers beneath it.
                 _needs_bg = any(e.get("type") == "copy_background" for e in (p["c"].get("effects") or []) if e.get("on", True))
                 bg_snap = canvas.copy() if _needs_bg else None
-                self._draw_cpu(canvas, p, q, fast, precise, bg=bg_snap)
+                _t = _rp.t0(); self._draw_cpu(canvas, p, q, fast, precise, bg=bg_snap); _rp.end("cpu_draw:" + p["c"]["kind"], _t)
             except Exception as ex: print("composite error:", ex)
         return canvas
+    def _gpu_fx_ok(self, c):
+        """Cheap test before anything is made: may the effect stack of this clip run as GPU nodes at all?"""
+        return bool(_GFX is not None and (c.get("effects") or clip_has_mask(c)) and not clip_spills(c) and not os.environ.get("MINICUT_NO_GPU_FX") and _GFX.active())
+    def _gpu_fx_items(self, c, lt, base_np):
+        """The (type, parameters) list of the clip's enabled effects when ALL of them can run as GPU nodes, else None. Decided before any picture is made.
+        base_np: the picture (numpy) the effects will work on, or None for a picture that lives on the GPU (a rig, a compound): such a picture is never
+        opaque, so the answer is asked of the builders (blurs and glows have see-through versions since render core step 3b)."""
+        if not self._gpu_fx_ok(c): return None
+        items = []
+        for e in c.get("effects") or []:
+            if not e.get("on", True): continue
+            t = e.get("type"); spec = _EFX.FX.get(t)
+            if spec is None: continue
+            if spec.get("area") or not _GFX.supported(t): return None
+            try: items.append((t, _EFX._effect_params(e, spec, lt)))
+            except Exception: return None
+        if not items and not clip_has_mask(c): return None            # [] with a mask: only the mask runs as a node
+        if items and base_np is None:
+            pl = _GFX.build_chain_shape(64, 64, 4, False, items, _EFX._Ctx(1.0, lt, False))
+            if pl is None or pl.n < len(items): return None
+        return items
+    def _gpu_fx_job(self, c, p, base, fast, E, items=None):
+        """An EffectJob when EVERY enabled effect of the clip has an OpenGL version (and none needs the CPU: area / spill / copy_background, light effects
+        and blurs on see-through media); the effects then run on the layer's own GPU texture, in the frame's engine, with no upload and no read-back.
+        Otherwise None: the CPU does the whole stack as before. base: the picture (numpy), a MeshJob or a CompoundJob."""
+        isnp = isinstance(base, np.ndarray); lt = p["lt"]
+        if items is None: items = self._gpu_fx_items(c, lt, base if isnp else None)
+        if items is None: return None
+        if isnp: h, w = base.shape[:2]; ch = base.shape[2]; opaque = ch == 3 or _GFX._alpha_opaque(base)
+        else: w, h = base.W, base.H; ch = 4; opaque = False
+        if max(w, h) > E.max_tex: return None
+        groups = []
+        if items:
+            plan = _GFX.build_chain_shape(w, h, ch, opaque, items, _EFX._Ctx(max(1e-3, float(w) / max(1.0, float(p["bw"]))), lt, fast))
+            if plan is None or plan.n < len(items): return None
+            groups = list(plan.groups)
+        planes = {}
+        if clip_has_mask(c):                                        # the mask (made by the same function as for the CPU, cached) is a texture; its pass comes after the effects
+            mp = self._gpu_mask_plane(c, w, h)
+            if mp is not None:
+                from . import glfx_lib as _GL
+                groups.append([_GFX.Pass(_GL._MASKPASS, {}, {"u_in": "in", "u_mask": _GL.MASK_NAME}, "main")]); planes[_GL.MASK_NAME] = mp; _rp.count("mask_gpu")
+        if not groups: return None
+        _rp.count("effect_gpu"); return _meshgl.EffectJob(base, groups, w, h, cache=bool(isnp and c.get("kind") == "image"), planes=planes)       # a still image: its texture is kept, only the passes run each frame
+    def _gpu_mask_plane(self, c, w, h):
+        """The combined mask of the clip as an (h, w, 1) uint8 array; the same array object every time while the mask and the size stay the same."""
+        cache = getattr(self, "_mask_gpu", None)
+        if cache is None: cache = self._mask_gpu = OrderedDict()
+        key = (json.dumps(layer_list(c), sort_keys=True, default=str), w, h); m = cache.get(key)
+        if m is None:
+            m2 = self._mask_cache.get(key)
+            if m2 is None:
+                m2 = combined_mask(c, w, h)
+                if m2 is None: return None
+                self._mask_cache[key] = m2
+            m = cache[key] = np.ascontiguousarray(m2.reshape(h, w, 1))
+            while len(cache) > 48: cache.popitem(last=False)
+        return m
+    def _gpu_layers(self, plans, q, fast, E):
+        """The layer list the GPU engine draws, for the frame and for the inside of a compound (render core, step 2): one builder for both.
+        Each entry is (picture | MeshJob | CompoundJob, placement matrix, opacity, cache flag)."""
+        layers = []
+        for p in plans:
+            try:
+                _t = _rp.t0(); img, _ = self._layer_image(p, q, fast, gpu=True, mesh=E); _rp.end("layer:" + p["c"]["kind"], _t)
+                if img is not None: layers.append((img, self._matrix(p, q, img.shape[1], img.shape[0]), p["op"], p["c"]["kind"] in ("image", "text", "gif") and not p["c"].get("effects"), p["c"].get("blend", "normal")))
+            except Exception as ex: print("composite error:", ex)
+        return layers
+    def _compound_job(self, src, ts, ds, E):
+        """A compound clip (own opacity / move / scale / turn, no effect or mask) as a sub-frame for the GPU engine: the clips inside are planned like the
+        clips of a frame and drawn into a texture on the GPU (nested compounds the same way), instead of one CPU pass and an upload. None when something
+        inside needs the CPU (a blend mode, copy_background): the caller then uses the CPU picture of the compound as before."""
+        if os.environ.get("MINICUT_NO_GPU_COMPOUND"): return None
+        d = getattr(_TLS, "cdepth", 0)
+        if d >= 8: return None
+        W = max(2, int(round(src.proj.w * ds))); H = max(2, int(round(src.proj.h * ds))); _TLS.cdepth = d + 1
+        try:
+            plans = self._plans(src.proj, float(ts), ds, W, H)
+            for p in plans:
+                c = p["c"]
+                if c.get("blend", "normal") != "normal" or any(e.get("type") == "copy_background" and e.get("on", True) for e in (c.get("effects") or ())):
+                    _rp.count("compound_cpu_fallback"); return None
+            layers = self._gpu_layers(plans, ds, False, E); _rp.count("compound_gpu")
+            return _meshgl.CompoundJob(W, H, layers)
+        finally: _TLS.cdepth = d
     def render_alpha(self, proj, t, q):
         """One frame drawn over a transparent canvas, in ONE pass: (picture over black, alpha), both uint8. The alpha is added up while the
         layers are drawn. A blend mode inside is drawn with its blend mode and counts as normal for the alpha."""
@@ -567,11 +698,11 @@ class Renderer:
         try:
             W, H = max(2, int(round(proj.w * q))), max(2, int(round(proj.h * q)))
             plans = self._plans(proj, t, q, W, H)
-            canvas = np.zeros((H, W, 3), np.uint8); acc = np.zeros((H, W), np.uint8); precise = q >= 0.999
+            canvas = np.zeros((H, W, 3), np.uint8); acc = np.zeros((H, W), np.uint8); precise = q >= 0.999; _rp.count("compound_cpu_frames")
             for p in plans:
                 try:
                     need_bg = any(e.get("type") == "copy_background" and e.get("on", True) for e in (p["c"].get("effects") or ()))
-                    self._draw_cpu(canvas, p, q, False, precise, bg=canvas.copy() if need_bg else None, acc=acc)
+                    _t = _rp.t0(); self._draw_cpu(canvas, p, q, False, precise, bg=canvas.copy() if need_bg else None, acc=acc); _rp.end("compound_cpu:" + p["c"]["kind"], _t)
                 except Exception as ex: print("composite error:", ex)
             return canvas, acc
         finally: _TLS.depth = depth
@@ -706,6 +837,8 @@ class RenderWorker(QThread):
         _TLS.preview = True
         try:                                  # Patch 35: this is the only thread that may run OpenGL effect chains
             from . import glfx; glfx.enable_current_thread()
+        except Exception: pass
+        try: _meshgl.enable_current_thread()                    # Patch 46
         except Exception: pass
         if CFG.get("low_priority", True): lower_thread_priority()
         while True:

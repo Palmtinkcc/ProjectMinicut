@@ -6,6 +6,7 @@ from ..shared.icons import *
 from ..shared.widgets import AnimatedDialog, tool
 from ..shared.ui import *
 from ..render.export import EXPORTS
+from .build_preview import BuildPreview
 from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QMessageBox
 
@@ -75,6 +76,7 @@ class TaskRow(QFrame):
         col = QVBoxLayout(); col.setSpacing(4); self.title = QLabel(); self.title.setObjectName("TaskTitle")
         self.bar = QProgressBar(); self.bar.setTextVisible(False); self.bar.setFixedHeight(6); self.bar.setRange(0, 1000)
         self.info = QLabel(); self.info.setObjectName("Dim"); col.addWidget(self.title); col.addWidget(self.bar); col.addWidget(self.info); h.addLayout(col, 1)
+        self.pv = BuildPreview(); self.pv.hide(); h.addWidget(self.pv)          # the frame being built (only for a running export)
         self.b_open = tool("", "Show in folder", None, icon="folder_open", isize=18); self.b_cancel = tool("", "Cancel", None, icon="cancel", isize=20); self.b_rm = tool("", "Remove from list", None, icon="close", isize=16)
         for b in (self.b_open, self.b_cancel, self.b_rm): h.addWidget(b)
     def set(self, state, title, frac, info, can_cancel, can_open, can_remove):
@@ -99,7 +101,7 @@ class TasksDialog(AnimatedDialog):
         self.host = QWidget(); self.lay = QVBoxLayout(self.host); self.lay.setContentsMargins(0, 0, 0, 0); self.lay.setSpacing(6); self.lay.addStretch(1)
         sa = QScrollArea(); sa.setWidgetResizable(True); sa.setWidget(self.host); sa.setMinimumHeight(240); sa.setFrameShape(QFrame.NoFrame); self.body.addWidget(sa, 1)
         self.empty = QLabel("Nothing is running in the background"); self.empty.setStyleSheet("color:#8e8e9b;font-size:13px;"); self.empty.setAlignment(Qt.AlignCenter); self.empty.setMinimumHeight(120); self.lay.insertWidget(0, self.empty)
-        self.timer = QTimer(self); self.timer.setInterval(300); self.timer.timeout.connect(self.refresh); self.timer.start(); self.refresh()
+        self.timer = QTimer(self); self.timer.setInterval(150); self.timer.timeout.connect(self.refresh); self.timer.start(); self.refresh()
     def _set_par(self, v):
         EXPORTS.max_parallel = int(v); self.app.settings["export_parallel"] = int(v); self.app.settings.save(); EXPORTS._pump()
     def _cancel_all(self):
@@ -121,6 +123,9 @@ class TasksDialog(AnimatedDialog):
                 if o.state == "running": eta = t.eta() if t is not None else None; info = ("%d%%" % round(f * 100) if f is not None else "…") + (("   ·   " + _fmt_eta(eta)) if eta else "") + (("   ·   " + t.detail) if (t is not None and t.detail) else "")
                 else: info = {"queued": "waiting", "done": "done", "cancelled": "cancelled", "failed": o.msg[-90:].replace("\n", " ")}.get(o.state, "")
                 row.set(o.state, o.title, f, info, o.state in ("queued", "running"), o.state == "done", o.state in ("done", "failed", "cancelled"))
+                show = o.state == "running" and bool(self.app.settings["show_build_preview"]) and getattr(o, "thumb", None) is not None
+                row.pv.setVisible(show)
+                if show: row.pv.feed(o.thumb)
             else:
                 f = o.fraction(); eta = o.eta()
                 info = ("%d%%" % round(f * 100) if f is not None else "…") + (("   ·   " + _fmt_eta(eta)) if eta else "") + (("   ·   " + o.detail) if o.detail else "")

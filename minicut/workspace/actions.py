@@ -6,6 +6,8 @@ from ..shared.core import _sel_clips, _shift_keys
 from ..shared.compound import *
 from ..shared.ui import *
 from ..shared.widgets import *
+from ..shared import marks as MK
+from ..render.audio import mix_audio
 from .timeline import *
 from .panels import *
 
@@ -116,11 +118,12 @@ class WorkspaceMixin:
             self._insp_t = now; self.inspector.refresh()
         if hasattr(self, "timeline_panel"):
             tp = self.timeline_panel; tp.snap_btn.setChecked(self.snap_on); tp._lock = True
+            if getattr(tp, "beat_btn", None) is not None and self.proj: tp.beat_btn.setChecked(bool(self.proj.beat_grid.get("on")))
             tp.zoom.setValue(max(0, min(1000, int(math.log(max(1, self.timeline.pps / 2), 1000) * 1000)))); tp._lock = False
     def sync_zoom_slider(self):self.refresh_ui()
     def toggle_snap(self):self.snap_on=not self.snap_on; self.settings['snap']=self.snap_on; self.settings.save(); self.refresh_ui()
     def import_dialog(self):
-        paths,_=QFileDialog.getOpenFileNames(self,'Import media',self.settings['asset_folder'],'Media files (*'+ ' *'.join(sorted(VIDEO_EXT|IMAGE_EXT|GIF_EXT|AUDIO_EXT))+');;All files (*)')
+        paths,_=QFileDialog.getOpenFileNames(self,'Import media',self.settings['asset_folder'],'Media files (*'+ ' *'.join(sorted(VIDEO_EXT|IMAGE_EXT|GIF_EXT|AUDIO_EXT|BONE_EXT))+');;All files (*)')
         if paths:self.import_files(paths)
     def import_files(self,paths):self.add_files(paths,self.t,None,only_import=True)
     def add_files(self,paths,start=None,track=None,only_import=False):
@@ -185,30 +188,60 @@ class WorkspaceMixin:
         return bool(gone)
     @editor_only
     def add_marker(self):
-        """Put a marker on the ruler at the playhead (again at the same place: remove it)."""
+        """Put a mark on the ruler at the playhead (again at the same place: remove it). With 'Lock to beat' on, the mark lands on the beat."""
         if not self.proj: return
-        t = round(self.t, 3); near = [m for m in self.proj.markers if abs(m - t) < 0.5 / max(1, self.proj.fps)]
-        self.checkpoint(); self.proj.markers = sorted(m for m in self.proj.markers if m not in near) if near else sorted(self.proj.markers + [t])
-        for m in near: self.proj.marker_names.pop("%.3f" % m, None)
+        self.checkpoint(); MK.toggle_mark(self.proj, self.t, self.proj.fps)
         if hasattr(self, "timeline"): self.timeline.update()
     def remove_marker(self, t):
-        self.checkpoint(); self.proj.markers = [m for m in self.proj.markers if abs(m - t) > 1e-4]; self.proj.marker_names.pop("%.3f" % t, None); self.timeline.update()
+        self.checkpoint(); MK.remove_mark(self.proj, t); self.timeline.update()
     def rename_marker(self, t):
-        """Patch 44: give a marker a name (shown next to it on the ruler); an empty name removes it."""
-        key = "%.3f" % t; txt, ok = QInputDialog.getText(self, "Marker", "Name of this marker:", text=self.proj.marker_names.get(key, ""))
+        """Patch 44: give a mark a name (shown next to it on the ruler); an empty name removes it."""
+        key = "%.3f" % t; txt, ok = QInputDialog.getText(self, "Mark", "Name of this mark:", text=self.proj.marker_names.get(key, ""))
         if not ok: return
         self.checkpoint()
         if txt.strip(): self.proj.marker_names[key] = txt.strip()
         else: self.proj.marker_names.pop(key, None)
         self.timeline.update()
     def clear_markers(self):
-        if self.proj and self.proj.markers: self.checkpoint(); self.proj.markers = []; self.proj.marker_names = {}; self.timeline.update()
+        if self.proj and self.proj.markers: self.checkpoint(); MK.clear_marks(self.proj); self.timeline.update()
     def goto_marker(self, direction):
-        """Jump the playhead to the previous (-1) or next (+1) marker."""
+        """Jump the playhead to the previous (-1) or next (+1) mark."""
         if not self.proj or not self.proj.markers: return
-        eps = 0.5 / max(1, self.proj.fps); ms = sorted(self.proj.markers)
-        target = next((m for m in reversed(ms) if m < self.t - eps), None) if direction < 0 else next((m for m in ms if m > self.t + eps), None)
+        target = MK.neighbour(self.proj, self.t, direction, 0.5 / max(1, self.proj.fps))
         if target is not None: self.seek(target)
+    def toggle_beat_lock(self):
+        """Patch 44: 'Lock to beat' - new and moved marks snap to the beat grid (set up by Auto mark, or the tempo in its dialog)."""
+        if not self.proj: return
+        self.checkpoint(); g = self.proj.beat_grid; self.proj.beat_grid = dict(g, on=not g["on"])
+        if hasattr(self, "toast"): self.toast.show_msg("Lock to beat: %s  (%.1f BPM)" % ("ON" if self.proj.beat_grid["on"] else "off", g["bpm"]))
+        self.refresh_ui()
+        if hasattr(self, "timeline"): self.timeline.update()
+    def mark_sources(self):
+        """Sounds Auto mark can listen to: the selected clip, the whole timeline mix."""
+        P = self.proj; out = []
+        def mix(clips):
+            def fn():
+                p2 = copy.copy(P); p2.clips = list(clips); t1 = max([c["start"] + c["dur"] for c in clips] + [0.1]); t0 = min([c["start"] for c in clips] + [t1])
+                return mix_audio(p2, t0, t1, SR, True), SR, t0
+            return fn
+        c = self.sel_clip()
+        if c is not None and c["kind"] in ("video", "audio", "compound"): out.append(("Selected clip: " + c["name"], mix([c])))
+        aud = [x for x in P.clips if x["kind"] in ("video", "audio", "compound")]
+        if aud: out.append(("Whole timeline (all sound)", mix(aud)))
+        return out
+    @editor_only
+    def auto_mark(self):
+        """Patch 44: Auto mark - the marks come from the sound (beats or hits), coloured by the sound, optionally locked to the beat."""
+        if not self.proj: return
+        src = self.mark_sources()
+        if not src: self.toast.show_msg("Put a video or an audio clip on the timeline first"); return
+        from ..shared.marks_ui import AutoMarkDialog
+        d = AutoMarkDialog(self, self.proj, src, self.proj.fps)
+        if not d.exec() or not d.result_found: return
+        self.checkpoint(); MK.apply_found(self.proj, d.result_found, d.replace); self.proj.beat_grid = d.result_grid
+        self.toast.show_msg("%d marks added" % len(d.result_found)); self.timeline.update()
+    def mark_hooks(self):
+        return {"checkpoint": self.checkpoint, "changed": lambda: self.timeline.update(), "add": self.add_marker, "rename": self.rename_marker, "auto": self.auto_mark, "grid_toggle": self.toggle_beat_lock}
     def place_free(self, c, want_track=None):
         """Put clip c on a track where it does not cover another clip: its own track when that is free at that time,
         else the nearest free track of the same kind, else a NEW track (above a video track, below an audio track)."""

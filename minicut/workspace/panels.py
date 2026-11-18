@@ -102,6 +102,10 @@ class MaskCanvas(QWidget):
     def mouseReleaseEvent(self, e): self.drag = None
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MiddleButton: self.zoom = 1.0; self.pan = (0.0, 0.0); self.update()
+    touch_ok = True
+    def touch_pinch(self, f, pos): self.zoom_by(f, pos)
+    def touch_pan(self, dx, dy):
+        if self.zoom > 1.0: self.pan = (self.pan[0] + dx, self.pan[1] + dy); self.update()
     def wheelEvent(self, e):
         """Wheel = zoom the picture (every mask mode, so small details can be edited). Ctrl + wheel = make the mask bigger / smaller."""
         e.accept(); up = e.angleDelta().y() > 0
@@ -356,7 +360,7 @@ class MediaDelegate(QStyledItemDelegate):
             for i in range(n):
                 a = (min(1.0, pk[int((i + .5) / n * len(pk))] * 3) if (pk is not None and len(pk)) else 0.25 + 0.2 * math.sin(i * 0.7)) * (th.height() / 2 - 6)
                 x = th.left() + 4 + i * 4; p.drawLine(QPointF(x, mid - max(1, a)), QPointF(x, mid + max(1, a)))
-        elif kind in ("video", "image", "gif"):
+        elif kind in ("video", "image", "gif", "bone2d"):
             pm = self._pixmap(path, kind, (frac * dur) if (frac is not None and not mprev_active) else 1.0, 110) or (self._pixmap(path, kind, 1.0, 110))
             if pm is not None:
                 if kind != "video": p.fillRect(th, self._checker())
@@ -370,7 +374,7 @@ class MediaDelegate(QStyledItemDelegate):
                 p.setPen(QPen(QColor("#ffffff"), 2, Qt.SolidLine, Qt.RoundCap)); p.drawLine(QPointF(vx, th.top() + 1), QPointF(vx, th.bottom() - 1))
             else:
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 130)); p.drawRect(QRectF(th.left(), th.bottom() - 4, th.width(), 4)); p.setBrush(QColor(c["accent"])); p.drawRect(QRectF(th.left(), th.bottom() - 4, th.width() * frac, 4))
-        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 150)); p.drawRoundedRect(QRectF(th.left() + 5, th.top() + 5, 22, 20), 6, 6); p.drawPixmap(int(th.left() + 8), int(th.top() + 7), svg_pixmap({"video": "video", "image": "image", "gif": "gif", "audio": "audio"}.get(kind, "video"), "#ffffff", 16))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 150)); p.drawRoundedRect(QRectF(th.left() + 5, th.top() + 5, 22, 20), 6, 6); p.drawPixmap(int(th.left() + 8), int(th.top() + 7), svg_pixmap({"video": "video", "image": "image", "gif": "gif", "audio": "audio", "bone2d": "compound"}.get(kind, "video"), "#ffffff", 16))
         if dur > 0:
             txt = _fmt_dur(dur); f = QFont(p.font()); f.setPixelSize(11); f.setBold(True); p.setFont(f); w = p.fontMetrics().horizontalAdvance(txt) + 10
             p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 150)); p.drawRoundedRect(QRectF(th.right() - w - 5, th.bottom() - 25, w, 19), 6, 6); p.setPen(QColor("#ffffff")); p.drawText(QRectF(th.right() - w - 5, th.bottom() - 25, w, 19), Qt.AlignCenter, txt)
@@ -426,6 +430,7 @@ class MediaList(QListWidget):
         if not i.isValid(): return
         if not i.data(Qt.UserRole) in {x.data(Qt.UserRole) for x in self.selectedItems()}: self.setCurrentIndex(i)
         rec = self.app.is_recording_file(i.data(Qt.UserRole)); m = QMenu(self)
+        if i.data(Qt.UserRole + 1) == "bone2d": m.addAction("Edit rig (Bone2D)", lambda p=i.data(Qt.UserRole): self.app.open_bone2d(p)); m.addSeparator()
         m.addAction("Delete recording (also deletes the file)" if rec else "Remove from media pool", self.app.media.remove_selected); m.exec(e.globalPos())
     def startDrag(self, actions):
         self._drag_started = True; pm = getattr(self.app, "media", None)
@@ -460,10 +465,11 @@ class MediaPanel(Panel):
     def __init__(self, app):
         super().__init__("Media"); self.app = app
         self.head.addWidget(Btn("Import", "import", "accent", "Add video, image or sound files to this project", app.import_dialog, h=28))
+        self.head.addWidget(tool("", "Bone2D: make or edit a puppet (pictures joined by bones)", app.bone2d_menu, icon="compound", isize=20))
         self.head.addWidget(tool("", "Choose the asset folder (saved for every project)", self.choose_folder, icon="folder_open", isize=20))
         self.head.addWidget(tool("", "Refresh the list", self.reload, icon="refresh", isize=20))
         self.tabs = IndexTabs(["In project", "Asset folder"]); self.tabs.currentChanged.connect(lambda *_: self.reload()); self.body.addWidget(self.tabs)
-        row = QHBoxLayout(); row.setSpacing(6); self.search = TextField("", "Search…"); self.filter = Dropdown([(x, x) for x in ("All", "Video", "Image", "GIF", "Audio")], 92)
+        row = QHBoxLayout(); row.setSpacing(6); self.search = TextField("", "Search…"); self.filter = Dropdown([(x, x) for x in ("All", "Video", "Image", "GIF", "Audio", "Bone2D")], 92)
         self.search.textChanged.connect(self.reload); self.filter.changed.connect(self.reload)
         row.addWidget(self.search, 1); row.addWidget(self.filter); self.body.addLayout(row)
         self.folder_lbl = label("", True, 11); self.body.addWidget(self.folder_lbl)
@@ -665,12 +671,16 @@ class Inspector(Panel):
         sec = Section("Curve presets", "timeline"); sec.addRight(Btn("Save", "save", "ghost", "Keep the curve above as a preset of your own", self._save_preset, h=26)); sec.addRight(self.more_btn)
         self.preset_grid = QGridLayout(); self.preset_grid.setSpacing(8); sec.body.addLayout(self.preset_grid); f.addWidget(sec)
         f.addStretch(); self.tabs.addTab(sa, "Keys", "keys", "Keyframes and motion curves")
+        # ---- Bone2D: which animation of the rig this clip plays, loop, speed ----
+        from .bone2d_ui import Bone2DPanel
+        sa, f = page(); self.b2d_panel = Bone2DPanel(app); f.addWidget(self.b2d_panel); f.addStretch(); self.tabs.addTab(sa, "Bone2D", "compound", "Which animation of the puppet plays, and how")
     # ---- refresh ----
     def _refresh_core(self, full=False):
         c = self.app.sel_clip(); self.empty.setVisible(c is None); self.tabs.setVisible(c is not None)
         if not c: return
         self.loading = True; k = c["kind"]; vis = is_visual(k)
-        for i, ok in enumerate((vis, vis, k == "text", k in ("video", "audio", "compound"), k in SPEED_KINDS, True)): self.tabs.setTabVisible(i, ok)
+        for i, ok in enumerate((vis, vis, k == "text", k in ("video", "audio", "compound"), k in SPEED_KINDS, True, k == "bone2d")): self.tabs.setTabVisible(i, ok)
+        if k == "bone2d": self.b2d_panel.load(c)
         lt = self.app.t - c["start"]
         for n, row in self.rows.items(): row.set(prop_at(c, n, lt), key_at(c, n, lt) is not None, bool(c["props"][n]["k"]))
         ox, oy = (lambda o: (o[0], o[1]) if isinstance(o, (list, tuple)) and len(o) >= 2 else (0.0, 0.0))(c.get("origin"))

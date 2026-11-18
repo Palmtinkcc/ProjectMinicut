@@ -27,13 +27,16 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 GIF_EXT = {".gif"}
 
 
+BONE_EXT = {".bone2d"}
+
+
 AUDIO_EXT = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac", ".wma", ".opus"}
 
 
 BLENDS = ["normal", "add", "multiply", "screen", "overlay", "soft light", "darken", "lighten", "difference", "subtract"]
 
 
-CLIP_COLORS = {"video": "#1f4fbf", "image": "#1d6fa5", "gif": "#3b4fc4", "text": "#6b3fd1", "audio": "#0f7c8c"}
+CLIP_COLORS = {"video": "#1f4fbf", "image": "#1d6fa5", "gif": "#3b4fc4", "text": "#6b3fd1", "audio": "#0f7c8c", "bone2d": "#b4473f"}
 
 
 DEFAULT_PROPS = {"x": 0.0, "y": 0.0, "sx": 100.0, "sy": 100.0, "rot": 0.0, "opacity": 100.0, "volume": 100.0, "speed": 100.0}
@@ -65,10 +68,11 @@ def kind_of(p):
     if e in GIF_EXT: return "gif"
     if e in IMAGE_EXT: return "image"
     if e in AUDIO_EXT: return "audio"
+    if e in BONE_EXT: return "bone2d"
     return None
 
 
-def is_visual(k): return k in ("video", "image", "gif", "text", "compound")
+def is_visual(k): return k in ("video", "image", "gif", "text", "compound", "bone2d")
 
 
 def safe_path(p):
@@ -140,6 +144,9 @@ def probe(path):
             d = sum(max(20, f.info.get("duration", 100) or 100) for f in ImageSequence.Iterator(im)) / 1000
             return k, max(d, 0.1)
         if k == "image": return k, 5.0
+        if k == "bone2d":
+            from ..render.bone2d import file_duration
+            return k, file_duration(path)
         if k == "audio": return k, ffprobe_dur(path) or 1.0
     except Exception: pass
     return None, 0.0
@@ -319,10 +326,10 @@ class Settings:
                   "export_folder": os.path.join(os.path.expanduser("~"), "Videos"),
                   "preview_quality": 0.5, "preview_interp": "fast", "play_reduce": True, "frame_cache": 24,
                   "preview_fps": 30, "adaptive_preview": True, "hw_decode": False, "encode_hw": "auto", "proxy_preview": True, "proxy_height": 540, "proxy_quality": 23, "layout": None, "curve_presets": {}, "proxy_budget_gb": 40,
-                  "fit_viewport": True, "gpu_compose": "auto", "render_threads": 0, "preview_ram_mb": 512, "low_priority": True, "proxy_hw": "auto", "audio_cache_gb": 8,
+                  "fit_viewport": True, "gpu_compose": "auto", "render_threads": 0, "preview_ram_mb": 512, "ram_limit_mb": 1024, "low_priority": True, "proxy_hw": "auto", "audio_cache_gb": 8,
                   "migrated_v21": False, "waveform_gain": 3.0, "export_parallel": 2, "audio_input": "", "autosave": True, "autosave_min": 1,
                   "snap": True, "show_fps": False, "bake": False, "fx_adapt": True, "bake_max_gb": 2, "default_w": 1920, "default_h": 1080, "default_fps": 30,
-                  "export_preset": "fast", "export_space": 2, "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
+                  "export_preset": "fast", "export_space": 2, "show_build_preview": True, "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
         try:
             with open(self.file, "r", encoding="utf-8") as f: d = json.load(f)
             sc = d.pop("shortcuts", {}); self.d.update(d); self.d["shortcuts"].update(sc)
@@ -375,11 +382,11 @@ def make_track(kind, name):
 class Project:
     def __init__(self, name="Untitled", w=1920, h=1080, fps=30):
         self.name, self.w, self.h, self.fps = name, int(w), int(h), int(fps)
-        self.bg = "#000000"; self.path = None; self.media = []; self.clips = []; self.markers = []; self.marker_names = {}; self.graph = {"nodes": [], "links": [], "on": True}
+        self.bg = "#000000"; self.path = None; self.media = []; self.clips = []; self.markers = []; self.marker_names = {}; self.marker_colors = {}; self.beat_grid = {"on": False, "show": True, "bpm": 120.0, "offset": 0.0, "div": 1.0}; self.graph = {"nodes": [], "links": [], "on": True}
         self.tracks = [make_track("video", "Video 1"), make_track("audio", "Audio 1")]
     def to_dict(self):
         return {"version": 2, "name": self.name, "w": self.w, "h": self.h, "fps": self.fps, "bg": self.bg,
-                "media": self.media, "tracks": self.tracks, "clips": self.clips, "graph": self.graph, "markers": list(self.markers), "marker_names": dict(self.marker_names)}
+                "media": self.media, "tracks": self.tracks, "clips": self.clips, "graph": self.graph, "markers": list(self.markers), "marker_names": dict(self.marker_names), "marker_colors": dict(self.marker_colors), "beat_grid": dict(self.beat_grid)}
     @staticmethod
     def from_dict(d):
         p = Project(d.get("name", "Untitled"), d.get("w", 1920), d.get("h", 1080), d.get("fps", 30))
@@ -387,6 +394,8 @@ class Project:
         p.clips = d.get("clips", [])
         p.markers = sorted(round(float(x), 3) for x in (d.get("markers") or []) if isinstance(x, (int, float)))
         p.marker_names = {str(k): str(v) for k, v in (d.get("marker_names") or {}).items()}
+        p.marker_colors = {str(k): str(v) for k, v in (d.get("marker_colors") or {}).items()}                 # Patch 44: mark colours + beat grid
+        if isinstance(d.get("beat_grid"), dict): p.beat_grid.update({k: v for k, v in d["beat_grid"].items() if k in p.beat_grid})
         g = d.get("graph")
         if isinstance(g, dict): p.graph = {"nodes": list(g.get("nodes") or []), "links": list(g.get("links") or []), "on": g.get("on", True)}
         for t in p.tracks:

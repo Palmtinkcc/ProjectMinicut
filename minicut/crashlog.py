@@ -16,6 +16,8 @@ except Exception:
     APP_DIR = "."
 LOG = os.path.join(APP_DIR, "crash.log")
 _F = None                       # the open file (kept open for faulthandler)
+PREV_CRASHED = False            # Patch 57: did the run before this one end badly?  PREV_TAIL: the end of the log as it was then (for the pop-up)
+PREV_TAIL = ""
 _MAX = 400_000                  # the log is cut to its last part when it grows beyond this many bytes
 
 
@@ -53,6 +55,12 @@ def install():
     try:
         os.makedirs(APP_DIR, exist_ok=True); _trim()
         crashed = previous_run_crashed()
+        global PREV_CRASHED, PREV_TAIL
+        PREV_CRASHED = bool(crashed)
+        if crashed:
+            try:
+                with open(LOG, "rb") as f0: f0.seek(max(0, os.path.getsize(LOG) - 6000)); PREV_TAIL = f0.read().decode("utf-8", "replace")
+            except Exception: PREV_TAIL = ""
         _F = open(LOG, "a", encoding="utf-8", buffering=1)
         if crashed: _w("\n!! the previous run did not end cleanly (see the lines above this one for what it wrote)\n")
         _w("\n== started %s  python %s  pid %d\n" % (_stamp(), sys.version.split()[0], os.getpid()))
@@ -94,4 +102,14 @@ def install_qt():
             try: sys.__stderr__.write(msg + "\n")
             except Exception: pass
         qInstallMessageHandler(_h)
+    except Exception: pass
+
+
+def log_error_event(event, rep):
+    """Sink for the error hub (Patch 57): new errors, breaker trips and fixes go to crash.log (and to the console), the counter updates do not."""
+    try:
+        if event in ("new", "trip", "fix"):
+            _w("-- error %s [%s] %s %s: %s (x%d) fixes=%s\n" % (_stamp(), event, rep.source, rep.kind, rep.message[:300], rep.count, "; ".join(rep.fixes) or "none"))
+            try: sys.__stderr__.write("minicut error [%s] %s: %s\n" % (rep.source, rep.kind, rep.message[:200]))
+            except Exception: pass
     except Exception: pass

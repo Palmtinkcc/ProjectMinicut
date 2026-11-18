@@ -32,7 +32,7 @@ def lower_thread_priority():
 def apply_perf(settings, renderer=None):
     try: cv2.setNumThreads(render_threads(settings["render_threads"]))
     except Exception: pass
-    CFG["bg_threads"] = bg_threads()
+    CFG["bg_threads"] = bg_threads(); CFG["render_threads"] = int(settings["render_threads"])
     CFG["low_priority"] = bool(settings["low_priority"])
     CFG["proxy_hw"] = settings["proxy_hw"]
     CFG["audio_cache_gb"] = float(settings["audio_cache_gb"])
@@ -40,3 +40,9 @@ def apply_perf(settings, renderer=None):
         renderer.preview_cache_bytes = float(settings["preview_ram_mb"]) * 1e6 * 0.6
     from .gpu import GPU
     GPU.set_mode(settings["gpu_compose"])
+    # Patch 46: one RAM limit for the whole program (Settings > Graphic > Max RAM, 1 GB default; 0 = no limit): splits it between the caches
+    try:
+        from . import ramgov
+        ramgov.set_limit(int(settings.get("ram_limit_mb", 1024) or 0)); ramgov.base_mb(); ramgov.apply(renderer)
+    except Exception:
+        pass

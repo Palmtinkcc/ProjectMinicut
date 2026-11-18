@@ -292,6 +292,11 @@ class NodeView(QGraphicsView):
         x0 = int(math.floor(rect.left() / g)) * g; y0 = int(math.floor(rect.top() / g)) * g
         pts = [QPointF(x, y) for x in range(x0, int(rect.right()) + g, g) for y in range(y0, int(rect.bottom()) + g, g)]
         p.drawPoints(QPolygonF(pts))
+    touch_ok = True; touch_menu = True                                  # Touch: pinch = zoom, two fingers = pan, long press = menu
+    def touch_pinch(self, f, pos):
+        from ..touch import view_pinch; view_pinch(self, f, pos)
+    def touch_pan(self, dx, dy):
+        from ..touch import view_pan; view_pan(self, dx, dy)
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15; cur = self.transform().m11()
         if 0.25 <= cur * f <= 2.5: self.scale(f, f)

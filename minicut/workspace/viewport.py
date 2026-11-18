@@ -306,6 +306,12 @@ class Viewport(QWidget, PointOverlay):
         self.update()
     def mouseDoubleClickEvent(self, e):
         if not self._hit(e.position())[0]: self.zoom = 1.0; self.pan = QPointF(); self.update()
+    touch_ok = True                                                     # Touch: two fingers zoom + pan (see minicut/touch.py)
+    def touch_pinch(self, f, pos):
+        old = self.zoom; self.zoom = max(0.1, min(8.0, self.zoom * f))
+        if old: c = QPointF(self.width() / 2, self.height() / 2) + self.pan; self.pan += (c - pos) * (self.zoom / old - 1)
+        self.update()
+    def touch_pan(self, dx, dy): self.pan += QPointF(dx, dy); self.update()
     def wheelEvent(self, e):
         f = 1.12 if e.angleDelta().y() > 0 else 1 / 1.12; old = self.zoom
         self.zoom = max(0.1, min(8.0, self.zoom * f)); pos = e.position()
