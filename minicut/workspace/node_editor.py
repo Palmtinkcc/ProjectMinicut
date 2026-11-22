@@ -13,7 +13,7 @@ NODE_HELP = ("Drag a block from the list (or double-click it) into the canvas.\n
              "Drag from a round socket to another socket to connect.\n\n"
              "Choose a media on the left to edit only the nodes for that media. Nodes that work on all media stay visible.\n\n"
              "Mouse: drag empty space = box select · middle button or Space = pan · wheel = zoom · right click = menu.\n"
-             "Keys: Del delete · Ctrl+D duplicate · M mute · Ctrl+Z / Ctrl+Y undo / redo.")
+             "Keys: Del delete · Ctrl+C / Ctrl+X / Ctrl+V copy / cut / paste (wires are kept) · Ctrl+D duplicate · Ctrl+A select all · M mute · Ctrl+Z / Ctrl+Y undo / redo.")
 def pastel(hex_color, mix=0.58):
     """A soft (pastel) version of a category colour: the colour mixed with white."""
     c = QColor(hex_color); m = lambda v: int(v + (255 - v) * mix)
@@ -97,6 +97,7 @@ class NodeItem(QGraphicsItem):
         s = NumberField(float(v), -1e6, 1e6, 2, "", "", scrub=0.05).setLight(); s.setFixedSize(72, 20); s.changed.connect(cb); return s
     def _set(self, k, v):
         self.sc.begin_edit(False); self.d["p"][k] = v; self.sc.touched()
+        if k == "clip": self.sc._apply_filter()
     def _build(self):
         sp = self.spec; ins, outs = sp["ins"], sp["outs"]; sink = sp["sink"] is not None; rows = max(len(ins), len(outs))
         box = QWidget(); box.setAttribute(Qt.WA_TranslucentBackground)
@@ -177,11 +178,30 @@ class NodeScene(QGraphicsScene):
     # ---- media filter: show only the nodes of the chosen media (plus nodes that work on every media) ----
     def set_filter(self, cid):
         self.filter_clip = cid; self._apply_filter()
-    def _visible(self, d):
-        if self.filter_clip is None: return True
+    def _own_ok(self, d):
         return d.get("p", {}).get("clip") in (None, "*", "@target", self.filter_clip)
+    def _visible_ids(self):
+        """With a clip chosen, show its Set-nodes and every node that feeds them. A node that only feeds the Set-nodes of OTHER clips is hidden
+        (so each clip shows just its own copy of a chain); nodes feeding nothing yet stay visible."""
+        nodes = {d["id"]: d for d in self.graph["nodes"]}
+        if self.filter_clip is None: return set(nodes)
+        ups = {}
+        for r in self.graph["links"]: ups.setdefault(r["to"], set()).add(r["from"])
+        feeds_sink = set(); vis = set()
+        for nid, d in nodes.items():
+            if NODE_TYPES.get(d.get("type"), {}).get("sink") is None: continue
+            ok = self._own_ok(d); todo = [nid]; seen = {nid}
+            while todo:
+                cur = todo.pop(); feeds_sink.add(cur)
+                if ok: vis.add(cur)
+                for u in ups.get(cur, ()):
+                    if u not in seen: seen.add(u); todo.append(u)
+        for nid, d in nodes.items():
+            if nid not in feeds_sink and self._own_ok(d): vis.add(nid)
+        return vis
     def _apply_filter(self):
-        for it in self.items_by_id.values(): it.setVisible(self._visible(it.d))
+        vis = self._visible_ids()
+        for nid, it in self.items_by_id.items(): it.setVisible(nid in vis)
         for li in self.link_items: li.setVisible(li.a.node.isVisible() and li.b.node.isVisible())
     def _linked_inputs(self, node): return {r["ti"] for r in self.graph["links"] if r["to"] == node.d["id"]}
     def _refresh_all(self):
@@ -224,14 +244,56 @@ class NodeScene(QGraphicsScene):
         for it in sel:
             if isinstance(it, NodeItem) and it.d["id"] in self.items_by_id: self.remove_node(it)
         self.touched()
+    # ---- copy / paste / duplicate: the wires between the chosen nodes are copied too ----
+    NODE_CLIP_KIND = "minicut-nodes"
+    def _snapshot(self, items):
+        ids = {i.d["id"] for i in items}
+        nodes = [copy.deepcopy(i.d) for i in items]
+        links = [copy.deepcopy(r) for r in self.graph["links"] if r["from"] in ids and r["to"] in ids]
+        return {"kind": self.NODE_CLIP_KIND, "nodes": nodes, "links": links}
+    def _spawn(self, snap, dx, dy, retarget=None):
+        """Insert fresh copies of a snapshot (new ids, internal wires rebuilt) and select them. Returns the new items."""
+        remap = {}; made = []
+        for n in snap["nodes"]:
+            d = copy.deepcopy(n); d["id"] = new_id(); remap[n["id"]] = d["id"]; d["x"] = round(float(d.get("x", 0)) + dx, 1); d["y"] = round(float(d.get("y", 0)) + dy, 1)
+            p = d.setdefault("p", {})
+            if retarget and p.get("clip") not in (None, "*", "@target", retarget) and NODE_TYPES.get(d.get("type"), {}).get("sink") is not None: p["clip"] = retarget
+            self.graph["nodes"].append(d); it = NodeItem(self, d); self.addItem(it); self.items_by_id[d["id"]] = it; made.append(it)
+        for l in snap.get("links", []):
+            a, b = self.items_by_id.get(remap.get(l.get("from"))), self.items_by_id.get(remap.get(l.get("to")))
+            if a is None or b is None or l.get("fo", 0) >= len(a.out_socks) or l.get("ti", 0) >= len(b.in_socks): continue
+            rec = {"from": a.d["id"], "fo": l.get("fo", 0), "to": b.d["id"], "ti": l.get("ti", 0)}; self.graph["links"].append(rec)
+            self._add_link_item(a.out_socks[rec["fo"]], b.in_socks[rec["ti"]], rec)
+        self._refresh_all(); self._apply_filter(); self.clearSelection()
+        for it in made: it.setSelected(True)
+        return made
     def duplicate_selected(self):
         src = [i for i in self.selectedItems() if isinstance(i, NodeItem)]
         if not src: return
-        self.begin_edit(); self.clearSelection()
-        for it in src:
-            d = copy.deepcopy(it.d); d["id"] = new_id(); d["x"] += 30; d["y"] += 30; self.graph["nodes"].append(d)
-            n = NodeItem(self, d); self.addItem(n); self.items_by_id[d["id"]] = n; n.setSelected(True)
-        self._apply_filter(); self.touched()
+        self.begin_edit(); self._spawn(self._snapshot(src), 30, 30); self.touched()
+    def copy_selected(self):
+        src = [i for i in self.selectedItems() if isinstance(i, NodeItem)]
+        if not src: return False
+        snap = self._snapshot(src); NodeScene.CLIPBOARD = snap
+        try: QApplication.clipboard().setText(json.dumps(snap))
+        except Exception: pass
+        return True
+    def clipboard_snapshot(self):
+        try:
+            d = json.loads(QApplication.clipboard().text())
+            if isinstance(d, dict) and d.get("kind") == self.NODE_CLIP_KIND and isinstance(d.get("nodes"), list) and d["nodes"]: return d
+        except Exception: pass
+        return getattr(NodeScene, "CLIPBOARD", None)
+    def paste(self, at=None):
+        snap = self.clipboard_snapshot()
+        if not snap or not any(isinstance(n, dict) and n.get("type") in NODE_TYPES for n in snap["nodes"]): return False
+        snap = {"kind": snap.get("kind"), "nodes": [n for n in snap["nodes"] if isinstance(n, dict) and n.get("type") in NODE_TYPES], "links": [l for l in snap.get("links", []) if isinstance(l, dict)]}
+        xs = [n.get("x", 0) for n in snap["nodes"]]; ys = [n.get("y", 0) for n in snap["nodes"]]
+        if at is not None: dx, dy = at.x() - min(xs), at.y() - min(ys)
+        else: dx = dy = 30
+        self.begin_edit(); self._spawn(snap, dx, dy, retarget=self.filter_clip); self.touched(); return True
+    def cut_selected(self):
+        if self.copy_selected(): self.delete_selected()
     def toggle_mute(self):
         for it in [i for i in self.selectedItems() if isinstance(i, NodeItem)]:
             self.begin_edit(); it.d["p"]["mute"] = not it.d["p"].get("mute"); it.update()
@@ -315,6 +377,13 @@ class NodeView(QGraphicsView):
         ctrl = bool(e.modifiers() & Qt.ControlModifier)
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace): self.page.delete_selected(); return
         if e.key() == Qt.Key_D and ctrl: self.page.scene.duplicate_selected(); return
+        if e.key() == Qt.Key_C and ctrl: self.page.scene.copy_selected(); return
+        if e.key() == Qt.Key_X and ctrl: self.page.scene.cut_selected(); return
+        if e.key() == Qt.Key_V and ctrl: self.page.paste_nodes(); return
+        if e.key() == Qt.Key_A and ctrl:
+            for i in self.scene().items():
+                if isinstance(i, NodeItem) and i.isVisible(): i.setSelected(True)
+            return
         if e.key() == Qt.Key_Z and ctrl: self.page.app.do_undo(); return
         if e.key() == Qt.Key_Y and ctrl: self.page.app.do_redo(); return
         if e.key() == Qt.Key_M: self.page.scene.toggle_mute(); return
@@ -446,6 +515,9 @@ class NodeDock(QWidget):
         if self.app.proj is None or getattr(self, "_syncing", False): return
         self.checkpoint(True); self.app.proj.graph["on"] = bool(v); self.app.graph_edited()
     def delete_selected(self): self.scene.delete_selected()
+    def paste_nodes(self):
+        v = self.view; p = v.viewport().mapFromGlobal(QCursor.pos())
+        self.scene.paste(v.mapToScene(p) if v.viewport().rect().contains(p) else None)
     def add_from_palette(self, it):
         typ = it.data(Qt.UserRole)
         if typ: self.scene.add_node(typ, self.view.mapToScene(self.view.viewport().rect().center()))
@@ -458,6 +530,8 @@ class NodeDock(QWidget):
         a = self.app; P = a.proj
         if P is None or not self.isVisible(): return
         if id(P) != self._pid: self.reload(); return
+        g = P.graph
+        if len(g.get("nodes", [])) != len(self.scene.items_by_id) or len(g.get("links", [])) != len(self.scene.link_items): self.reload(); return    # nodes were added from outside (split / paste of a clip)
         if a.sel != self._last_sel: self._last_sel = a.sel; self._follow()
         try:
             clip = next((c for c in P.clips if c["id"] == self.media_id), None) if self.media_id else None

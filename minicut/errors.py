@@ -206,3 +206,4 @@ def report(source, exc, severity=None, fix=None): return HUB.report(source, exc,
 def note_fix(source, text): HUB.note_fix(source, text)
 def tripped(source): return HUB.tripped(source)
 def success(source): HUB.success(source)
+def install_hooks(): HUB.install_hooks()

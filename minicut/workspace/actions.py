@@ -8,6 +8,7 @@ from ..shared.ui import *
 from ..shared.widgets import *
 from ..shared import marks as MK
 from ..render.audio import mix_audio
+from ..render.nodegraph import clone_clip_nodes, extract_clip_nodes, instantiate_clip_nodes
 from .timeline import *
 from .panels import *
 
@@ -165,7 +166,9 @@ class WorkspaceMixin:
         self.checkpoint(); cut=self.t-c['start']; (add_key(c,'speed',cut) if c['props'].get('speed',{}).get('k') else None); right=copy.deepcopy(c); right['id']=new_id(); right['start']=self.t; right['inp']+=src_delta(c,cut); right['dur']-=cut; c['dur']=cut
         for prop in c['props'].values():prop['k']=[k for k in prop['k'] if k['t']<=cut]
         for prop in right['props'].values():prop['k']=[dict(k,t=k['t']-cut) for k in prop['k'] if k['t']>=cut]
-        self.proj.clips.append(right); self.sel=right['id']; self.on_changed()
+        right.pop('group',None)      # the new piece is its own clip: clicking or deleting it must never take the other piece along
+        self.proj.clips.append(right); clone_clip_nodes(self.proj, c['id'], right['id']); self.multi=set()          # the new piece gets its own copy of the clip's nodes (nothing shared); a stale multi-selection (the old clip) was what made Delete remove both pieces
+        self.sel = c['id'] if self.settings['after_split']=='original' else right['id']; self.on_changed()
     def delete_sel(self):
         if self.in_nodes(): self.nodes_page.delete_selected(); return
         if self.delete_sel_keys(): return
@@ -258,15 +261,16 @@ class WorkspaceMixin:
         if self.in_nodes(): self.nodes_page.scene.duplicate_selected(); return
         c=self.sel_clip()
         if c:
-            self.checkpoint(); n=copy.deepcopy(c); n['id']=new_id(); n['start']+=n['dur']; n.pop('group',None); self.place_free(n, c['track']); self.proj.clips.append(n); self.sel=n['id']; self.multi=set(); self.on_changed()
-    @editor_only
+            self.checkpoint(); n=copy.deepcopy(c); n['id']=new_id(); n['start']+=n['dur']; n.pop('group',None); self.place_free(n, c['track']); self.proj.clips.append(n); clone_clip_nodes(self.proj, c['id'], n['id']); self.sel=n['id']; self.multi=set(); self.on_changed()
     def copy_clip(self):
+        if self.in_nodes(): self.nodes_page.scene.copy_selected(); return          # Ctrl+C inside the node editor copies the selected nodes
         c=self.sel_clip()
-        if c:self._clip_copy=copy.deepcopy(c)
-    @editor_only
+        if c: self._clip_copy=copy.deepcopy(c); self._clip_copy_nodes=extract_clip_nodes(self.proj.graph, c['id']) if self.proj else None
     def paste_clip(self):
+        if self.in_nodes(): self.nodes_page.paste_nodes(); return                  # Ctrl+V inside the node editor pastes nodes
         if self._clip_copy and self.proj:
             self.checkpoint(); c=copy.deepcopy(self._clip_copy); c['id']=new_id(); c['start']=self.t; c.pop('group',None)
+            instantiate_clip_nodes(self.proj.graph, getattr(self, '_clip_copy_nodes', None), c['id'])      # its own nodes, not shared with the source clip
             self.place_free(c, self._clip_copy.get('track')); self.proj.clips.append(c); self.sel=c['id']; self.multi=set(); self.on_changed()
     def replace_media(self):
         c=self.sel_clip()

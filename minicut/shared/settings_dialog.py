@@ -33,7 +33,7 @@ class SettingsDialog(AnimatedDialog):
         main = QHBoxLayout(); main.setSpacing(6)
         self.nav = SideNav(["Graphic", "Storage", "Export", "Theme"], gap_before=(3,)); main.addWidget(self.nav)
         line = QFrame(); line.setFixedWidth(2); line.setStyleSheet("background:rgba(255,255,255,70);border:none;"); main.addWidget(line)
-        self.stack = QStackedWidget(); main.addWidget(self.stack, 1); self.body.addLayout(main, 1)
+        self.stack = FadeStack(); main.addWidget(self.stack, 1); self.body.addLayout(main, 1)
         self._pages = []
         for _ in range(4):
             sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
@@ -96,6 +96,8 @@ class SettingsDialog(AnimatedDialog):
         self.hwdec = QCheckBox("GPU video decode (each file is checked against the CPU decoder; falls back to CPU)"); self.hwdec.setChecked(bool(s["hw_decode"]))
         self.showfps = QCheckBox("Show FPS on the preview"); self.showfps.setChecked(bool(s["show_fps"]))
         self.showfps.setToolTip("Shows the FPS and how many milliseconds each frame takes to build, in the top-left corner of the preview.")
+        self.split_box = QComboBox(); self.split_box.addItem("The new piece (right side)", "new"); self.split_box.addItem("The original piece (left side)", "original"); self.split_box.setCurrentIndex(1 if s["after_split"] == "original" else 0)
+        self.split_box.setToolTip("Which piece stays selected (and gets deleted by Delete) right after you split a clip.")
         self.build_pv = QCheckBox("Show Frame build Preview"); self.build_pv.setChecked(bool(s["show_build_preview"]))
         self.build_pv.setToolTip("In the Tasks window, shows the frame that an export is building at the moment, next to its progress bar.")
         self.bake_cb = QCheckBox("Adaptive proxy: bake heavy segments in the background (experimental)"); self.bake_cb.setChecked(bool(s["bake"]))
@@ -192,6 +194,7 @@ class SettingsDialog(AnimatedDialog):
         bake_clear = QPushButton("Clear baked proxies"); bake_clear.clicked.connect(self.clear_bake)
         for lab, wd in (("", self.hwdec), ("", self.bake_cb), ("", self.bake_gb), ("", bake_clear), ("", self.fxadapt), ("Render threads", self.thr_box), ("RAM cache", self.ram_box), ("Max RAM", self.ramlim_box), ("", self.prio_cb)): self.row(P, c, f, lab, wd)
         c, f = self.sec(P, "Recording", "mic"); self.row(P, c, f, "Microphone", self.mic)
+        c, f = self.sec(P, "Editing", "adjust"); self.row(P, c, f, "After split, select", self.split_box, "split cut delete selected piece")
 
     def _build_storage(self, s):
         P = PG_STORAGE; vl = self._pages[P]
@@ -414,7 +417,7 @@ class SettingsDialog(AnimatedDialog):
         CFG["hw_decode"] = s["hw_decode"]; CFG["bake"] = s["bake"]; CFG["fx_adapt"] = s["fx_adapt"]; CFG["bake_max_gb"] = s["bake_max_gb"]; CFG["encode_hw"] = s["encode_hw"]; clear_gpu_cache()
         from ..render.gpu import GPU
         GPU.set_mode(s["gpu_compose"])
-        s["audio_input"] = self.mic.currentData() or ""; s["autosave"] = self.autosave.isChecked(); s["autosave_min"] = self.autosave_min.value()
+        s["after_split"] = self.split_box.currentData() or "new"; s["audio_input"] = self.mic.currentData() or ""; s["autosave"] = self.autosave.isChecked(); s["autosave_min"] = self.autosave_min.value()
         os.makedirs(s["project_folder"], exist_ok=True); self._collect()
         try:
             from ..render.nodegraph import refresh_node_cats; refresh_node_cats()

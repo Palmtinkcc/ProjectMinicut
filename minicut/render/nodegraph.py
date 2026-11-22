@@ -546,3 +546,53 @@ def node_debug(proj, t, clip):
 
 
 def default_graph(): return {"nodes": [], "links": [], "on": True}
+
+
+# ── Per-clip node cloning (split / duplicate / copy-paste of a clip) ─────────
+def _clip_roots(graph, clip_id):
+    """Ids of the Set-nodes (sinks) of the graph that work on exactly this clip."""
+    return [n["id"] for n in graph.get("nodes", []) if n.get("type") in NODE_TYPES and NODE_TYPES[n["type"]]["sink"] is not None
+            and (n.get("p") or {}).get("clip") == clip_id]
+
+
+def extract_clip_nodes(graph, clip_id):
+    """Snapshot {"nodes": [...], "links": [...]} of everything that belongs to one clip: its Set-nodes plus every node feeding them
+    (the whole upstream chain). Deep copies, so it stays valid when the clip is deleted afterwards. None when the clip has no nodes."""
+    if not isinstance(graph, dict): return None
+    roots = _clip_roots(graph, clip_id)
+    if not roots: return None
+    links = [l for l in graph.get("links", []) if isinstance(l, dict)]
+    keep = set(roots); todo = list(roots)
+    while todo:
+        cur = todo.pop()
+        for l in links:
+            if l.get("to") == cur and l.get("from") not in keep: keep.add(l["from"]); todo.append(l["from"])
+    nodes = [copy.deepcopy(n) for n in graph.get("nodes", []) if n.get("id") in keep]
+    return {"clip": clip_id, "nodes": nodes, "links": [copy.deepcopy(l) for l in links if l.get("from") in keep and l.get("to") in keep]}
+
+
+def instantiate_clip_nodes(graph, snap, new_clip_id, dy=None):
+    """Add an independent copy of a snapshot to the graph for a new clip: every node and link gets a new id (nothing is shared with the
+    original), every reference to the old clip (the Set-nodes' target, Get-nodes of that clip) points to the new clip. Returns the new nodes."""
+    if not snap or not snap.get("nodes"): return []
+    old = snap.get("clip"); remap = {}; out = []
+    if new_clip_id == old: return []
+    graph["nodes"] = [n for n in graph.get("nodes", []) if not (NODE_TYPES.get(n.get("type"), {}).get("sink") is not None and (n.get("p") or {}).get("clip") == new_clip_id)]      # never stack a second copy on the same clip
+    ys = [n.get("y", 0.0) for n in snap["nodes"]]
+    if dy is None: dy = (max(ys) - min(ys)) + 260.0          # drop the copy below the original so the two never overlap
+    for n in snap["nodes"]:
+        d = copy.deepcopy(n); nid = new_id(); remap[n["id"]] = nid; d["id"] = nid; d["y"] = round(float(d.get("y", 0.0)) + dy, 1)
+        p = d.setdefault("p", {})
+        if p.get("clip") == old: p["clip"] = new_clip_id
+        out.append(d)
+    graph.setdefault("nodes", []).extend(out)
+    for l in snap.get("links", []):
+        if l.get("from") in remap and l.get("to") in remap:
+            r = copy.deepcopy(l); r["from"] = remap[l["from"]]; r["to"] = remap[l["to"]]; graph.setdefault("links", []).append(r)
+    return out
+
+
+def clone_clip_nodes(proj, old_clip_id, new_clip_id):
+    g = getattr(proj, "graph", None)
+    if not isinstance(g, dict): return 0
+    return len(instantiate_clip_nodes(g, extract_clip_nodes(g, old_clip_id), new_clip_id))

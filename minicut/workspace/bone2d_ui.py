@@ -1464,7 +1464,7 @@ class Bone2DPage(SyncMixin, QWidget):
             b.clicked.connect(lambda _=False, k=key: self.pick_tool(self.group_last.get(k, k))); bl.addWidget(b); self.tool_btns[key] = b
         bl.addStretch(); hs = QSplitter(Qt.Horizontal); hs.setChildrenCollapsible(False); hs.setHandleWidth(6); ml.addWidget(hs, 1); bar.setFixedWidth(bar.sizeHint().width() + 2); hs.addWidget(bar); hs.addWidget(self.canvas)       # drag the thin bars between the panels to resize them
         self.dock = QWidget(); self.dock.setMinimumWidth(220); self.dock.setMaximumWidth(700); dl = QVBoxLayout(self.dock); dl.setContentsMargins(0, 0, 0, 0); dl.setSpacing(6)
-        self.dock_tabs = Segmented([("Layers", "l"), ("Props", "p")], "l"); self.dock_tabs.changed.connect(self.pick_dock); dl.addWidget(self.dock_tabs); self.dock_stack = QStackedWidget(); dl.addWidget(self.dock_stack, 1)
+        self.dock_tabs = Segmented([("Layers", "l"), ("Props", "p")], "l"); self.dock_tabs.changed.connect(self.pick_dock); dl.addWidget(self.dock_tabs); self.dock_stack = FadeStack(); dl.addWidget(self.dock_stack, 1)
         lw = QWidget(); lv = QVBoxLayout(lw); lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(6); self.layers = LayerPanel(self)
         sa = QScrollArea(); sa.setWidgetResizable(True); sa.setFrameShape(QFrame.NoFrame); sa.setWidget(self.layers); lv.addWidget(sa, 1)
         row = QHBoxLayout(); row.setSpacing(4)
@@ -1511,7 +1511,7 @@ class Bone2DPage(SyncMixin, QWidget):
     def layers_changed(self, geom=True): self.doc.touch(geom=geom); self.doc.dirty = True; self.update_title(); self.layers.build(); self.rebuild_tree(); self.refresh_props(); self.canvas.update()
     def pick_dock(self, v): self.dock_stack.setCurrentIndex({"l": 0, "b": 1, "p": 2}[v])
     def set_mode(self, m):
-        self.mode = m; self.modes.setValue(m); self.bot.setVisible(m == "animate")
+        self.mode = m; self.modes.setValue(m); slide_visible(self.bot, m == "animate")
         if m == "animate" and self.canvas.tool in ("mesh", "vadd", "vdel", "vedit", "bone", "link", "line", "lasso", "weight"): self.pick_tool("select", keep_mode=True)
         self.refresh_props(); self.canvas.update(); self.sheet.update()
     GROUP_OF = {"mesh": "mesh", "vadd": "mesh", "vdel": "mesh", "vedit": "mesh", "bone": "bone", "line": "bone"}
@@ -1731,7 +1731,7 @@ class Bone2DPage(SyncMixin, QWidget):
     def _tree_edit(self, it, col): pass
     # ---- properties
     def _build_props(self):
-        self.pstack = QStackedWidget(); self.props.body.addWidget(self.pstack, 1)
+        self.pstack = FadeStack(); self.props.body.addWidget(self.pstack, 1)
         def page():
             sa = QScrollArea(); sa.setWidgetResizable(True); sa.setFrameShape(QFrame.NoFrame); w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(0, 0, 4, 0); v.setSpacing(8); sa.setWidget(w); return sa, v
         def num(lo, hi, dec, suf="", scrub=1.0):

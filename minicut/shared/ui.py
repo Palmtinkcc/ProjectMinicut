@@ -16,6 +16,7 @@ the program, so they all look the same, react the same way and can be restyled i
 from .deps import *
 from .icons import *
 from .theme import UI
+from PySide6.QtGui import QFontDatabase, QTextDocument
 
 
 def pal():
@@ -37,6 +38,150 @@ def _font(px, bold=False, base=None):
 
 
 def _clamp(v, lo, hi): return max(lo, min(hi, v))
+
+
+# ---------------------------------------------------- animation helpers (shared by every control) ------------------------------
+def anim_to(w, name, target, ms=150, default=0.0, curve=QEasingCurve.OutCubic):
+    """Slide the number w._v_<name> to `target` and repaint on every step (hover fades, switch knobs, tab underlines ...)."""
+    a = getattr(w, "_a_" + name, None)
+    if a is None:
+        a = QVariantAnimation(w); setattr(w, "_a_" + name, a)
+        def step(v, n=name): setattr(w, "_v_" + n, float(v)); w.update()
+        def done(n=name): setattr(w, "_r_" + n, False); w.update()
+        a.valueChanged.connect(step); a.finished.connect(done)
+    a.stop(); a.setEasingCurve(curve); a.setDuration(ms); a.setStartValue(getattr(w, "_v_" + name, default)); a.setEndValue(float(target)); setattr(w, "_r_" + name, True); a.start()
+
+
+def anim_val(w, name, default=0.0): return getattr(w, "_v_" + name, default)
+def anim_running(w, name): return bool(getattr(w, "_r_" + name, False))
+
+
+def mixc(a, b, t):
+    """Colour between a and b (t = 0..1), alpha included. 'transparent' borrows the other colour so it fades instead of going grey."""
+    ca, cb = QColor(a), QColor(b)
+    if ca.alpha() == 0: ca = QColor(cb.red(), cb.green(), cb.blue(), 0)
+    if cb.alpha() == 0: cb = QColor(ca.red(), ca.green(), ca.blue(), 0)
+    t = _clamp(t, 0.0, 1.0); f = lambda x, y: int(round(x + (y - x) * t))
+    return QColor(f(ca.red(), cb.red()), f(ca.green(), cb.green()), f(ca.blue(), cb.blue()), f(ca.alpha(), cb.alpha()))
+
+
+def slide_visible(w, on, ms=230):
+    """Show / hide a panel by sliding its height instead of popping (works with a minimum height too)."""
+    try:
+        a = getattr(w, "_slide", None)
+        if a is not None: a.stop()
+        BIG = 16777215
+        omin = getattr(w, "_orig_min_h", None)
+        if omin is None: omin = w._orig_min_h = w.minimumHeight()
+        if on and w.isVisible() and w.maximumHeight() >= BIG and not a: return
+        if (not on) and not w.isVisible(): return
+        if on: nat = max(getattr(w, "_nat_h", 0) or w.sizeHint().height() or 200, omin); w.setMaximumHeight(0); w.setMinimumHeight(0); w.setVisible(True)
+        else: nat = max(w.height(), 1); w._nat_h = nat
+        def put(v): v = int(v); w.setMinimumHeight(min(omin, v)); w.setMaximumHeight(v)
+        a = QVariantAnimation(w); a.setDuration(ms); a.setEasingCurve(QEasingCurve.OutCubic)
+        a.setStartValue(0 if on else nat); a.setEndValue(nat if on else 0); a.valueChanged.connect(put)
+        def done():
+            w.setMinimumHeight(omin); w.setMaximumHeight(BIG)
+            if not on: w.setVisible(False)
+            w._slide = None
+        a.finished.connect(done); w._slide = a; a.start()
+    except Exception: w.setVisible(on)
+
+
+class RoundTip(QWidget):
+    """The one tip bubble of the program: rounded, with an arrow when it points at a button, and a TIP badge for a description."""
+    _inst = None
+    ARROW, PAD = 7, 10
+    @classmethod
+    def get(cls):
+        if cls._inst is None: cls._inst = RoundTip()
+        return cls._inst
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground); self.setAttribute(Qt.WA_ShowWithoutActivating); self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.text = ""; self.badge = False; self.arrow = "none"; self.ax = 0; self._owner = None
+        self.fade = QPropertyAnimation(self, b"windowOpacity", self); self.fade.setDuration(140)
+        self.life = QTimer(self); self.life.setSingleShot(True); self.life.timeout.connect(self.hide_tip)
+    def _measure(self):
+        fm = QFontMetrics(_font(13)); bw = 38 if self.badge else 0
+        r = fm.boundingRect(0, 0, 300 - 2 * self.PAD - bw, 10000, int(Qt.TextWordWrap), self.text)
+        self.tw = r.width() + 2; w = self.tw + 2 * self.PAD + bw; h = max(r.height(), 18) + 2 * self.PAD - 4
+        self.bw = bw; self.body = QRectF(0.5, (self.ARROW if self.arrow == "up" else 0) + .5, w - 1, h - 1)
+        self.setFixedSize(int(w), int(h + (self.ARROW if self.arrow != "none" else 0)))
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = pal()
+        path = QPainterPath(); path.addRoundedRect(self.body, 10, 10)
+        if self.arrow != "none":
+            ax = _clamp(self.ax, 16, self.width() - 16); tri = QPainterPath()
+            if self.arrow == "down": y0 = self.body.bottom(); tri.moveTo(ax - self.ARROW, y0 - 1); tri.lineTo(ax, y0 + self.ARROW); tri.lineTo(ax + self.ARROW, y0 - 1)
+            else: y0 = self.body.top(); tri.moveTo(ax - self.ARROW, y0 + 1); tri.lineTo(ax, y0 - self.ARROW); tri.lineTo(ax + self.ARROW, y0 + 1)
+            tri.closeSubpath(); path = path.united(tri)
+        p.setPen(QPen(QColor(c["line"]), 1)); p.setBrush(QColor("#26262d")); p.drawPath(path)
+        x = self.PAD; cy = self.body.center().y()
+        if self.badge:
+            pill = QRectF(x, cy - 9, 32, 18); p.setPen(Qt.NoPen); p.setBrush(QColor(c["accent_d"])); p.drawRoundedRect(pill, 9, 9)
+            p.setPen(QColor(c["accent"])); p.setFont(_font(10, True)); p.drawText(pill, Qt.AlignCenter, "TIP"); x += self.bw
+        p.setPen(QColor(c["text"])); p.setFont(_font(13)); p.drawText(QRectF(x, self.body.top() + self.PAD - 2, self.tw + 4, self.body.height() - 2 * self.PAD + 4), int(Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap), self.text)
+    def _screen(self, pt):
+        return QApplication.screenAt(pt) or QApplication.primaryScreen()
+    def _show(self, owner, ms):
+        self._owner = owner; self._measure(); self.update(); self.setWindowOpacity(0.0); self.show(); self.raise_()
+        self.fade.stop(); self.fade.setStartValue(0.0); self.fade.setEndValue(1.0); self.fade.start(); self.life.start(ms)
+    def show_for(self, w, text, ms=4000):
+        """A small bubble above the button, its arrow pointing down at it (below with the arrow up when there is no room)."""
+        self.text = text; self.badge = False; self.arrow = "down"; self._measure()
+        top = w.mapToGlobal(QPoint(0, 0)); bot = w.mapToGlobal(QPoint(0, w.height())); cx = top.x() + w.width() // 2; scr = self._screen(QPoint(cx, top.y())).availableGeometry()
+        x = int(_clamp(cx - self.width() / 2, scr.left() + 4, scr.right() - self.width() - 4)); y = top.y() - self.height() - 3
+        if y < scr.top() + 2: self.arrow = "up"; self._measure(); y = bot.y() + 3
+        self.ax = cx - x; self.move(x, y); self._show(w, ms)
+    def show_at(self, text, gpos, owner=None, ms=7000):
+        """A description under the mouse (what Qt calls a tooltip), with the TIP badge in front."""
+        self.text = text; self.badge = True; self.arrow = "none"; self._measure(); scr = self._screen(gpos).availableGeometry()
+        x = int(_clamp(gpos.x() + 12, scr.left() + 4, scr.right() - self.width() - 4)); y = gpos.y() + 22
+        if y + self.height() > scr.bottom() - 4: y = gpos.y() - self.height() - 10
+        self.move(x, y); self._show(owner, ms)
+    def hide_tip(self): self.fade.stop(); self.hide(); self._owner = None
+    def hide_for(self, w):
+        if self._owner is w: self.hide_tip()
+
+
+class TipManager(QObject):
+    """Replaces Qt's square tooltips everywhere with RoundTip."""
+    def __init__(self, app): super().__init__(app); self.tip = RoundTip.get()
+    @staticmethod
+    def install(app):
+        m = TipManager(app); app.installEventFilter(m); app._tip_manager = m; return m
+    def eventFilter(self, o, e):
+        t = e.type()
+        try:
+            if t == QEvent.ToolTip and isinstance(o, QWidget):
+                txt = o.toolTip()
+                if not txt: return False
+                if Qt.mightBeRichText(txt): d = QTextDocument(); d.setHtml(txt); txt = d.toPlainText()
+                self.tip.show_at(txt.strip(), e.globalPos(), o); return True
+            if t in (QEvent.Leave, QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.Wheel, QEvent.KeyPress, QEvent.WindowDeactivate):
+                if self.tip.isVisible() and (t != QEvent.Leave or o is self.tip._owner): self.tip.hide_tip()
+        except Exception: pass
+        return False
+
+
+class FadeStack(QStackedWidget):
+    """A QStackedWidget that cross-fades when the page changes: a picture of the old page fades away over the new one."""
+    DUR = 200
+    def _fade_from(self, old):
+        try:
+            if old is None or not self.isVisible() or self.width() < 8 or self.height() < 8: return
+            pix = old.grab(); ov = QLabel(self); ov.setPixmap(pix); ov.setScaledContents(True); ov.setGeometry(self.rect()); ov.setAttribute(Qt.WA_TransparentForMouseEvents)
+            eff = QGraphicsOpacityEffect(ov); ov.setGraphicsEffect(eff); ov.show(); ov.raise_()
+            a = QPropertyAnimation(eff, b"opacity", ov); a.setDuration(self.DUR); a.setStartValue(1.0); a.setEndValue(0.0); a.setEasingCurve(QEasingCurve.OutCubic)
+            a.finished.connect(ov.deleteLater); a.start(); ov._a = a
+        except Exception: pass
+    def setCurrentIndex(self, i):
+        old = self.currentWidget() if i != self.currentIndex() else None
+        super().setCurrentIndex(i); self._fade_from(old)
+    def setCurrentWidget(self, w):
+        old = self.currentWidget() if w is not self.currentWidget() else None
+        super().setCurrentWidget(w); self._fade_from(old)
 
 
 def fmt_num(v, dec, suffix=""):
@@ -234,28 +379,93 @@ class Toggle(QWidget):
     def isChecked(self): return self.on
     def setChecked(self, v):
         v = bool(v)
-        if v != self.on: self.on = v; self.update()
+        if v != self.on: self.on = v; anim_to(self, "k", 1.0 if v else 0.0, 170, 0.0 if v else 1.0, QEasingCurve.OutBack)
     def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = _p(self); cy = self.height() / 2
-        p.setPen(Qt.NoPen); p.setBrush(QColor(c["accent"] if self.on else (c["line"] if getattr(self, "light", False) else c["field_h"]))); p.drawRoundedRect(QRectF(1, cy - 9, 34, 18), 9, 9)
-        p.setBrush(QColor("#06121a" if self.on else "#b9b9c4")); p.drawEllipse(QPointF(27 if self.on else 10, cy), 6.5, 6.5)
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = _p(self); cy = self.height() / 2; k = anim_val(self, "k", 1.0 if self.on else 0.0)
+        off = c["line"] if getattr(self, "light", False) else c["field_h"]
+        p.setPen(Qt.NoPen); p.setBrush(mixc(off, c["accent"], k)); p.drawRoundedRect(QRectF(1, cy - 9, 34, 18), 9, 9)
+        p.setBrush(mixc("#b9b9c4", "#06121a", k)); p.drawEllipse(QPointF(10 + 17 * k, cy), 6.5 + 0.8 * math.sin(math.pi * _clamp(k, 0, 1)), 6.5 + 0.8 * math.sin(math.pi * _clamp(k, 0, 1)))
         if self.text: p.setPen(QColor(c["text"])); p.setFont(_font(13)); p.drawText(QRectF(44, 0, self.width() - 44, self.height()), int(Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap), self.text)
+    def mousePressEvent(self, e): e.accept()
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.on = not self.on; self.update(); self.toggled.emit(self.on)
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.on = not self.on; anim_to(self, "k", 1.0 if self.on else 0.0, 170, 0.0 if self.on else 1.0, QEasingCurve.OutBack); self.toggled.emit(self.on)
+
+
+def _view_of(w):
+    """The (proxy, view) a widget lives in when it sits on a node inside the node canvas; (None, None) for a normal widget."""
+    try:
+        top = w.window(); px = top.graphicsProxyWidget()
+        if px is not None and px.scene() is not None and px.scene().views(): return px, px.scene().views()[0]
+    except Exception: pass
+    return None, None
+
+
+def _global_pt(w, pt):
+    """mapToGlobal that also works for a widget embedded in the node canvas (there mapToGlobal gives a wrong place, so the list never showed)."""
+    px, view = _view_of(w)
+    if px is None: return w.mapToGlobal(pt)
+    p = w.mapTo(w.window(), pt); sp = px.mapToScene(QPointF(p))
+    return view.viewport().mapToGlobal(view.mapFromScene(sp))
+
+
+def _popup_parent(w):
+    px, view = _view_of(w)
+    return view.window() if view is not None else w.window()
+
+
+def _place_popup(owner, pop):
+    """Open a pop-up under the owner (above it when there is no room), always inside the screen."""
+    below = _global_pt(owner, QPoint(0, owner.height() + 3)); above = _global_pt(owner, QPoint(0, -3))
+    try: scr = owner.screen().availableGeometry()
+    except Exception: scr = QApplication.primaryScreen().availableGeometry()
+    y = below.y() if below.y() + pop.height() < scr.bottom() else above.y() - pop.height()
+    y = max(scr.top() + 4, min(y, scr.bottom() - pop.height() - 4))
+    pop.move(max(scr.left() + 4, min(below.x(), scr.right() - pop.width() - 4)), y)
 
 
 # ======================================================= Dropdown =======================================================
-class _DropPopup(QFrame):
+class _PopupBase(QFrame):
+    """Frameless pop-up with real round corners (a see-through window) that fades and slides in."""
+    def __init__(self, owner):
+        super().__init__(_popup_parent(owner), Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_DeleteOnClose); self.setAttribute(Qt.WA_TranslucentBackground)
+    def paintEvent(self, e):
+        # a see-through window has no background of its own, so the rounded card is painted here
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = pal()
+        p.setPen(QPen(QColor(c["line"]), 1)); p.setBrush(QColor(c["card"])); p.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 10, 10)
+    def showEvent(self, e):
+        super().showEvent(e)
+        try:
+            end = self.pos(); self.setWindowOpacity(0.0); g = QParallelAnimationGroup(self)
+            a = QPropertyAnimation(self, b"windowOpacity", self); a.setDuration(150); a.setStartValue(0.0); a.setEndValue(1.0)
+            b = QPropertyAnimation(self, b"pos", self); b.setDuration(190); b.setStartValue(end + QPoint(0, -8)); b.setEndValue(end); b.setEasingCurve(QEasingCurve.OutCubic)
+            g.addAnimation(a); g.addAnimation(b); g.start(); self._open_anim = g
+        except Exception: self.setWindowOpacity(1.0)
+
+
+class _DropPopup(_PopupBase):
     picked = Signal(int)
+    MAXH = 320
     def __init__(self, owner, items, cur):
-        super().__init__(owner.window(), Qt.Popup | Qt.FramelessWindowHint); self.setAttribute(Qt.WA_DeleteOnClose); c = pal()
-        self.setStyleSheet("QFrame{background:%s;border:1px solid %s;border-radius:10px;}" % (c["card"], c["line"]))
-        v = QVBoxLayout(self); v.setContentsMargins(5, 5, 5, 5); v.setSpacing(1)
+        super().__init__(owner); self.setObjectName("DropPop"); c = pal()
+        self.setStyleSheet("QFrame#DropPop{background:%s;border:1px solid %s;border-radius:10px;}" % (c["card"], c["line"]))
+        outer = QVBoxLayout(self); outer.setContentsMargins(4, 4, 4, 4); outer.setSpacing(0)
+        self.sc = QScrollArea(); self.sc.setWidgetResizable(True); self.sc.setFrameShape(QFrame.NoFrame); self.sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sc.setStyleSheet("QScrollArea{background:transparent;border:none;}QScrollArea>QWidget>QWidget{background:transparent;}"
+                              "QScrollBar:vertical{background:transparent;width:8px;margin:2px;}QScrollBar::handle:vertical{background:%s;border-radius:3px;min-height:24px;}"
+                              "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}" % c["line"])
+        inner = QWidget(); inner.setStyleSheet("background:transparent;border:none;"); v = QVBoxLayout(inner); v.setContentsMargins(1, 1, 1, 1); v.setSpacing(1); self._cur_btn = None
         for i, (text, _d) in enumerate(items):
             b = QPushButton(text); b.setCursor(Qt.PointingHandCursor); b.setFocusPolicy(Qt.NoFocus); on = i == cur
             b.setStyleSheet("QPushButton{background:%s;color:%s;border:none;border-radius:6px;text-align:left;padding:6px 12px;font-size:13px;}QPushButton:hover{background:%s;}"
                             % (c["accent_d"] if on else "transparent", "#ffffff" if on else c["text"], c["field_h"]))
             b.clicked.connect(lambda _=False, i=i: (self.picked.emit(i), self.close())); v.addWidget(b)
+            if on: self._cur_btn = b
+        self.sc.setWidget(inner); outer.addWidget(self.sc)
+        sh = inner.sizeHint(); self.sc.setMinimumWidth(sh.width() + 12); self.sc.setFixedHeight(min(self.MAXH, sh.height() + 2))
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._cur_btn is not None: QTimer.singleShot(0, lambda: self.sc.ensureWidgetVisible(self._cur_btn, 0, 40) if self._cur_btn is not None else None)
 
 
 class Dropdown(QWidget):
@@ -281,19 +491,111 @@ class Dropdown(QWidget):
     def setCurrentData(self, d): self.setCurrentIndex(self.findData(d))
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = _p(self); r = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
-        p.setPen(QPen(QColor(c["line"] if not self._hover else c["dim"]), 1)); p.setBrush(QColor(c["field"] if not self._hover else c["field_h"])); p.drawRoundedRect(r, 7, 7)
-        p.setPen(QColor(c["text"])); p.setFont(_font(13 if self.height() >= 26 else 11)); p.drawText(QRectF(10, 0, self.width() - 32, self.height()), Qt.AlignVCenter | Qt.AlignLeft, p.fontMetrics().elidedText(self.currentText(), Qt.ElideRight, self.width() - 34))
+        h = anim_val(self, "h", 1.0 if self._hover else 0.0)
+        p.setPen(QPen(mixc(c["line"], c["dim"], h), 1)); p.setBrush(mixc(c["field"], c["field_h"], h)); p.drawRoundedRect(r, 7, 7)
+        p.setPen(QColor(c["text"])); p.setFont(self._label_font()); p.drawText(QRectF(10, 0, self.width() - 32, self.height()), Qt.AlignVCenter | Qt.AlignLeft, p.fontMetrics().elidedText(self.currentText(), Qt.ElideRight, self.width() - 34))
         p.drawPixmap(self.width() - 22, int(self.height() / 2 - 8), svg_pixmap("expand_more", c["dim"], 16))
-    def enterEvent(self, e): self._hover = True; self.update()
-    def leaveEvent(self, e): self._hover = False; self.update()
+    def _label_font(self): return _font(13 if self.height() >= 26 else 11)
+    def enterEvent(self, e): self._hover = True; anim_to(self, "h", 1.0, 140, 0.0)
+    def leaveEvent(self, e): self._hover = False; anim_to(self, "h", 0.0, 200, 1.0)
+    def _open_popup(self):
+        pop = _DropPopup(self, self.items, self.cur); pop.picked.connect(self._pick); pop.setMinimumWidth(self.width()); pop.adjustSize(); _place_popup(self, pop); pop.show()
+    def mousePressEvent(self, e): e.accept()          # a press that is not accepted never gets its release inside the node canvas (QGraphicsProxyWidget), so the list never opened
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton or not self.items: return
-        pop = _DropPopup(self, self.items, self.cur); pop.picked.connect(self._pick); pop.setMinimumWidth(self.width()); pop.adjustSize()
-        g = self.mapToGlobal(QPoint(0, self.height() + 3)); scr = self.screen().availableGeometry()
-        y = g.y() if g.y() + pop.height() < scr.bottom() else self.mapToGlobal(QPoint(0, 0)).y() - pop.height() - 3
-        pop.move(min(g.x(), scr.right() - pop.width() - 4), y); pop.show()
+        self._open_popup()
     def _pick(self, i):
         if i != self.cur: self.cur = i; self.update(); self.changed.emit(i)
+
+
+# ===================================================== Font picker ======================================================
+class _FontList(QListWidget):
+    """The list of fonts: every row shows the font's name written in that font (like CapCut); the star on the right marks a favourite."""
+    toggled = Signal(str)
+    picked = Signal(str)
+    STAR_W = 38
+    def mouseReleaseEvent(self, e):
+        it = self.itemAt(e.position().toPoint())
+        if it is not None and e.button() == Qt.LeftButton:
+            fam = it.data(Qt.UserRole)
+            if e.position().x() > self.viewport().width() - self.STAR_W: self.toggled.emit(fam)
+            else: self.picked.emit(fam)
+        e.accept()
+
+
+class _FontDelegate(QStyledItemDelegate):
+    def __init__(self, owner): super().__init__(owner); self.o = owner
+    def sizeHint(self, opt, idx): return QSize(10, 34)
+    def paint(self, p, opt, idx):
+        c = pal(); fam = idx.data(Qt.UserRole); r = QRectF(opt.rect).adjusted(2, 1, -2, -1); hov = bool(opt.state & QStyle.State_MouseOver)
+        p.save(); p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen)
+        on = fam == self.o.current
+        if on: p.setBrush(QColor(c["accent_d"])); p.drawRoundedRect(r, 6, 6)
+        elif hov: p.setBrush(QColor(c["field_h"])); p.drawRoundedRect(r, 6, 6)
+        f = QFont(fam); f.setPixelSize(17); p.setFont(f); p.setPen(QColor("#ffffff" if on else c["text"]))
+        p.drawText(QRectF(r.left() + 10, r.top(), r.width() - _FontList.STAR_W - 12, r.height()), Qt.AlignVCenter | Qt.AlignLeft, p.fontMetrics().elidedText(fam, Qt.ElideRight, int(r.width() - _FontList.STAR_W - 14)))
+        fav = fam in self.o.favs
+        p.setFont(_font(18)); p.setPen(QColor(c["key"] if fav else c["dim"])); p.drawText(QRectF(r.right() - _FontList.STAR_W, r.top(), _FontList.STAR_W - 4, r.height()), Qt.AlignCenter, "\u2605" if fav else "\u2606")
+        p.restore()
+
+
+class _FontPopup(_PopupBase):
+    picked = Signal(str)
+    def __init__(self, owner, families, cur, favs, on_fav):
+        super().__init__(owner); self.setObjectName("FontPop"); c = pal()
+        self.families = list(families); self.current = cur; self.favs = set(favs); self.on_fav = on_fav
+        self.setStyleSheet("QFrame#FontPop{background:%s;border:1px solid %s;border-radius:10px;}" % (c["card"], c["line"]))
+        v = QVBoxLayout(self); v.setContentsMargins(6, 6, 6, 6); v.setSpacing(6)
+        self.search = QLineEdit(); self.search.setPlaceholderText("Search fonts"); self.search.setClearButtonEnabled(True)
+        self.search.setStyleSheet("QLineEdit{background:%s;border:1px solid %s;border-radius:7px;color:%s;padding:5px 9px;font-size:13px;}QLineEdit:focus{border-color:%s;}" % (c["field"], c["line"], c["text"], c["accent"]))
+        self.search.textChanged.connect(self._fill); v.addWidget(self.search)
+        self.lst = _FontList(); self.lst.setFrameShape(QFrame.NoFrame); self.lst.setItemDelegate(_FontDelegate(self)); self.lst.setMouseTracking(True); self.lst.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.lst.setUniformItemSizes(True)
+        self.lst.setStyleSheet("QListWidget{background:transparent;border:none;outline:none;}QScrollBar:vertical{background:transparent;width:8px;margin:2px;}"
+                               "QScrollBar::handle:vertical{background:%s;border-radius:3px;min-height:24px;}QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}" % c["line"])
+        self.lst.picked.connect(lambda f: (self.picked.emit(f), self.close())); self.lst.toggled.connect(self._toggle); v.addWidget(self.lst)
+        self.hint = QLabel(""); self.hint.setStyleSheet("color:%s;font-size:11px;padding:0 4px;" % c["dim"]); v.addWidget(self.hint)
+        self.setFixedSize(max(300, owner.width()), 380); self._fill()
+        self.search.returnPressed.connect(self._pick_first)
+    def _fill(self, *_):
+        q = self.search.text().strip().lower(); keep = self.lst.verticalScrollBar().value() if self.lst.count() else 0
+        fams = [f for f in self.families if q in f.lower()]
+        fams = [f for f in fams if f in self.favs] + [f for f in fams if f not in self.favs]       # favourites first
+        self.lst.clear()
+        for f in fams: it = QListWidgetItem(); it.setData(Qt.UserRole, f); self.lst.addItem(it)
+        self.hint.setText("%d fonts  \u00b7  \u2605 = favourite" % len(fams) if fams else "No font found")
+        if keep and not q: self.lst.verticalScrollBar().setValue(keep)
+    def _toggle(self, fam):
+        (self.favs.discard if fam in self.favs else self.favs.add)(fam); self.on_fav(sorted(self.favs)); self._fill()
+    def _pick_first(self):
+        if self.lst.count(): self.picked.emit(self.lst.item(0).data(Qt.UserRole)); self.close()
+    def showEvent(self, e):
+        super().showEvent(e); self.search.setFocus()
+        def go():                                          # bring the current font into view (when there is no search)
+            for i in range(self.lst.count()):
+                if self.lst.item(i).data(Qt.UserRole) == self.current: self.lst.scrollToItem(self.lst.item(i), QAbstractItemView.PositionAtCenter); break
+        QTimer.singleShot(0, go)
+
+
+class FontPicker(Dropdown):
+    """A font chooser: the pop-up is short, has a search box, a star to keep favourites and shows each name in its own font.
+    store = anything with ["fav_fonts"] and save() (the app Settings); favourites are kept there."""
+    def __init__(self, families=None, store=None):
+        fams = sorted(set(families if families is not None else QFontDatabase.families()), key=str.lower)
+        super().__init__([(f, f) for f in fams]); self.store = store
+    def _label_font(self):
+        f = QFont(self.currentText() or QApplication.font().family()); f.setPixelSize(15); return f
+    def favs(self):
+        try: return list(self.store["fav_fonts"]) if self.store is not None else list(getattr(self, "_favs", []))
+        except Exception: return []
+    def _save_favs(self, lst):
+        try:
+            if self.store is not None: self.store["fav_fonts"] = list(lst); self.store.save()
+            else: self._favs = list(lst)
+        except Exception: pass
+    def _open_popup(self):
+        pop = _FontPopup(self, [t for t, _d in self.items], self.currentText(), self.favs(), self._save_favs)
+        pop.picked.connect(lambda f: self._pick(self.findData(f))); _place_popup(self, pop); pop.show()
 
 
 # ======================================================= Segmented ======================================================
@@ -303,23 +605,32 @@ class Segmented(QWidget):
         super().__init__(); self.items = list(items); self.cur = value if value is not None else (items[0][1] if items else None); self._hov = -1
         self.setFixedHeight(28); self.setMouseTracking(True); self.setCursor(Qt.PointingHandCursor)
     def value(self): return self.cur
-    def setValue(self, v): self.cur = v; self.update()
+    def _idx(self): return next((i for i, (_t, v) in enumerate(self.items) if v == self.cur), -1)
+    def _go(self, v):
+        old = self._idx(); self.cur = v; new = self._idx()
+        if old >= 0 and new >= 0: anim_to(self, "pos", new, 220, old, QEasingCurve.OutCubic)
+        self.update()
+    def setValue(self, v): self._go(v)
     def _rects(self):
         n = max(1, len(self.items)); w = self.width() / n; return [QRectF(i * w, 0, w, self.height()) for i in range(n)]
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = pal(); p.setPen(Qt.NoPen); p.setBrush(QColor(c["field"])); p.drawRoundedRect(QRectF(self.rect()), 8, 8)
+        n = max(1, len(self.items)); cw = self.width() / n; ci = self._idx()
+        if ci >= 0:
+            pos = anim_val(self, "pos", ci) if anim_running(self, "pos") else ci
+            p.setBrush(QColor(c["accent_d"])); p.setPen(QPen(QColor(c["accent"]), 1)); p.drawRoundedRect(QRectF(pos * cw, 0, cw, self.height()).adjusted(2, 2, -2, -2), 6, 6)
         for i, (r, (text, val)) in enumerate(zip(self._rects(), self.items)):
             on = val == self.cur; rr = r.adjusted(2, 2, -2, -2)
-            if on: p.setBrush(QColor(c["accent_d"])); p.setPen(QPen(QColor(c["accent"]), 1)); p.drawRoundedRect(rr, 6, 6)
-            elif i == self._hov: p.setBrush(QColor(c["field_h"])); p.setPen(Qt.NoPen); p.drawRoundedRect(rr, 6, 6)
+            if (not on) and i == self._hov: p.setBrush(QColor(c["field_h"])); p.setPen(Qt.NoPen); p.drawRoundedRect(rr, 6, 6)
             p.setPen(QColor("#ffffff" if on else c["dim"])); p.setFont(_font(12, on)); p.drawText(r, Qt.AlignCenter, text)
     def mouseMoveEvent(self, e):
         h = next((i for i, r in enumerate(self._rects()) if r.contains(e.position())), -1)
         if h != self._hov: self._hov = h; self.update()
     def leaveEvent(self, e): self._hov = -1; self.update()
+    def mousePressEvent(self, e): e.accept()
     def mouseReleaseEvent(self, e):
         for r, (_t, val) in zip(self._rects(), self.items):
-            if r.contains(e.position()) and val != self.cur: self.cur = val; self.update(); self.changed.emit(val); return
+            if r.contains(e.position()) and val != self.cur: self._go(val); self.changed.emit(val); return
 
 
 # ====================================================== Text inputs =====================================================
@@ -365,7 +676,7 @@ class Btn(QPushButton):
     In toolbar mode (_toolbar=True) the label hides unless the button is hovered or checked/active."""
     def __init__(self, text="", icon=None, kind="soft", tip="", cb=None, checkable=False, h=30):
         super().__init__(); self.label = text; self.ic = icon; self.kind = kind; self._h = h; self.setCheckable(checkable); self.setFocusPolicy(Qt.NoFocus); self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(h); self._toolbar = False
+        self.setFixedHeight(h); self._toolbar = False; self.bubble = False
         if tip: self.setToolTip(tip)
         if cb: self.clicked.connect(cb)
         fm = QFontMetrics(_font(13, True)); self._full = 10 + (22 if icon else 0) + (fm.horizontalAdvance(text) + 4 if text else 0); self._compact = False; self.setMinimumWidth(self._full)
@@ -381,28 +692,38 @@ class Btn(QPushButton):
     def _show_label(self):
         """Whether the text label should be rendered right now."""
         if self._compact: return False
-        if self._toolbar: return self.underMouse() or self.isChecked()
+        if self._toolbar: return False                   # the name is shown in a small bubble above the button instead
         return bool(self.label)
     def sizeHint(self):
         if self._compact: return QSize(34 + 8, self._h)
-        if self._toolbar and not (self.underMouse() or self.isChecked()): return QSize(34 + 8, self._h)
+        if self._toolbar: return QSize(34 + 8, self._h)
         return QSize(self._full + 8, self._h)
     def enterEvent(self, e):
-        if self._toolbar: self.setMinimumWidth(self._full); self.updateGeometry(); self.update()
+        anim_to(self, "h", 1.0, 130, 0.0)
+        if getattr(self, "bubble", False) or self._toolbar: QTimer.singleShot(90, self._bubble_now)
         super().enterEvent(e)
     def leaveEvent(self, e):
-        if self._toolbar and not self.isChecked(): self.setMinimumWidth(34); self.updateGeometry(); self.update()
+        anim_to(self, "h", 0.0, 220, 1.0); RoundTip.get().hide_for(self)
         super().leaveEvent(e)
+    def _bubble_now(self):
+        try:
+            if not (self.underMouse() and self.isVisible()): return
+            name = self.label or (self.toolTip() or "").split("\n")[0]
+            if name: RoundTip.get().show_for(self, name)
+        except RuntimeError: pass
     def setIconName(self, n): self.ic = n; self.update()
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); c = pal(); r = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5); on = self.isChecked(); en = self.isEnabled()
-        hov = self.underMouse() and en; down = self.isDown()
-        if self.kind == "accent": bg, fg, br = (c["accent"] if not hov else "#4ae0f5"), "#06121a", c["accent"]
-        elif self.kind == "danger": bg, fg, br = (c["field"] if not hov else "#4a2a2e"), c["danger"], c["line"]
-        elif self.kind == "ghost": bg, fg, br = (c["field_h"] if hov else "transparent"), c["text"], "transparent"
-        else: bg, fg, br = (c["field_h"] if hov else c["field"]), c["text"], c["line"]
-        if on: bg, fg, br = c["accent_d"], "#ffffff", c["accent"]
-        if down: bg = c["field_h"] if self.kind != "accent" else "#1aa9c0"
+        down = self.isDown(); h = anim_val(self, "h", 1.0 if (self.underMouse() and en) else 0.0) if en else 0.0
+        def look(hov):
+            if self.kind == "accent": return (c["accent"] if not hov else "#4ae0f5"), "#06121a", c["accent"]
+            if self.kind == "danger": return (c["field"] if not hov else "#4a2a2e"), c["danger"], c["line"]
+            if self.kind == "ghost": return (c["field_h"] if hov else "transparent"), c["text"], "transparent"
+            return (c["field_h"] if hov else c["field"]), c["text"], c["line"]
+        (b0, fg, br0), (b1, _f1, br1) = look(False), look(True)
+        bg, br = mixc(b0, b1, h), mixc(br0, br1, h)
+        if on: bg, fg, br = QColor(c["accent_d"]), "#ffffff", QColor(c["accent"])
+        if down: bg = QColor(c["field_h"] if self.kind != "accent" else "#1aa9c0"); r = r.adjusted(1, 1, -1, -1)         # a small push when pressed
         if not en: fg = "#5d6476"
         p.setPen(QPen(QColor(br), 1)); p.setBrush(QColor(bg)); p.drawRoundedRect(r, 8, 8)
         show_lbl = self._show_label()
@@ -452,8 +773,16 @@ class NavTabs(QWidget):
     def __init__(self, items, h=52, line=True):
         super().__init__(); self.items = list(items); self.cur = 0; self.vis = [True] * len(self.items); self._hov = -1; self.line = line
         self.setFixedHeight(h); self.setMouseTracking(True); self.setCursor(Qt.PointingHandCursor)
+    def go(self, i):
+        """Move the underline to tab i (animated) and make it the current one."""
+        if 0 <= i < len(self.items) and i != self.cur: anim_to(self, "ci", i, 240, self.cur, QEasingCurve.OutCubic)
+        self.cur = i; self.update()
+    def _cx(self, f):
+        R = self._rects(); lo = int(math.floor(f)); t = f - lo; a, b = R.get(lo), R.get(lo + 1)
+        if a is not None and b is not None: return a.center().x() * (1 - t) + b.center().x() * t
+        r = R.get(int(round(f))) or R.get(self.cur); return r.center().x() if r is not None else 0.0
     def setCurrent(self, i):
-        if 0 <= i < len(self.items) and i != self.cur: self.cur = i; self.update(); self.changed.emit(i)
+        if 0 <= i < len(self.items) and i != self.cur: self.go(i); self.changed.emit(i)
     def setTabVisible(self, i, v):
         if self.vis[i] != v: self.vis[i] = v; self.update()
     def _rects(self):
@@ -466,7 +795,9 @@ class NavTabs(QWidget):
             ic, text, _tip = self.items[i]; on = i == self.cur; col = c["accent"] if on else (c["text"] if i == self._hov else c["dim"])
             p.drawPixmap(int(r.center().x() - 11), int(r.top() + 6), svg_pixmap(ic, col, 22)); p.setPen(QColor(col)); p.setFont(_font(11, on))
             p.drawText(QRectF(r.left(), r.top() + 30, r.width(), 18), Qt.AlignHCenter | Qt.AlignTop, text)
-            if on: p.setPen(Qt.NoPen); p.setBrush(QColor(c["accent"])); p.drawRoundedRect(QRectF(r.center().x() - 14, self.height() - 3, 28, 3), 1.5, 1.5)
+        if self.cur in self._rects():
+            cx = self._cx(anim_val(self, "ci", self.cur)) if anim_running(self, "ci") else self._rects()[self.cur].center().x()
+            p.setPen(Qt.NoPen); p.setBrush(QColor(c["accent"])); p.drawRoundedRect(QRectF(cx - 14, self.height() - 3, 28, 3), 1.5, 1.5)
     def mouseMoveEvent(self, e):
         h = next((i for i, r in self._rects().items() if r.contains(e.position())), -1)
         if h != self._hov: self._hov = h; self.update(); self.setToolTip(self.items[h][2] if h >= 0 else "")
@@ -480,13 +811,13 @@ class TabHost(QWidget):
     """NavTabs + the pages. Same calls as a QTabWidget (addTab, setTabVisible, setCurrentIndex ...)."""
     currentChanged = Signal(int)
     def __init__(self):
-        super().__init__(); v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0); self.nav = NavTabs([]); self.stack = QStackedWidget(); v.addWidget(self.nav); v.addWidget(self.stack, 1)
+        super().__init__(); v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0); self.nav = NavTabs([]); self.stack = FadeStack(); v.addWidget(self.nav); v.addWidget(self.stack, 1)
         self.nav.changed.connect(self._ch)
     def addTab(self, page, text, icon="adjust", tip=""):
         self.nav.items.append((icon, text, tip or text)); self.nav.vis.append(True); self.stack.addWidget(page); self.nav.update(); return self.stack.count() - 1
     def _ch(self, i): self.stack.setCurrentIndex(i); self.currentChanged.emit(i)
     def setCurrentIndex(self, i):
-        if self.nav.vis[i]: self.nav.cur = i; self.nav.update(); self.stack.setCurrentIndex(i); self.currentChanged.emit(i)
+        if self.nav.vis[i]: self.nav.go(i); self.stack.setCurrentIndex(i); self.currentChanged.emit(i)
     def currentIndex(self): return self.nav.cur
     def setTabVisible(self, i, v):
         self.nav.setTabVisible(i, v)

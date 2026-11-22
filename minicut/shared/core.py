@@ -329,7 +329,7 @@ class Settings:
                   "fit_viewport": True, "gpu_compose": "auto", "render_threads": 0, "preview_ram_mb": 512, "ram_limit_mb": 1024, "low_priority": True, "proxy_hw": "auto", "audio_cache_gb": 8,
                   "migrated_v21": False, "waveform_gain": 3.0, "export_parallel": 2, "audio_input": "", "autosave": True, "autosave_min": 1,
                   "snap": True, "show_fps": False, "bake": False, "fx_adapt": True, "bake_max_gb": 2, "default_w": 1920, "default_h": 1080, "default_fps": 30,
-                  "export_preset": "fast", "export_space": 2, "show_build_preview": True, "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
+                  "export_preset": "fast", "export_space": 2, "after_split": "new", "fav_fonts": [], "show_build_preview": True, "shortcuts": dict(DEFAULT_SHORTCUTS), "theme": {}}
         try:
             with open(self.file, "r", encoding="utf-8") as f: d = json.load(f)
             sc = d.pop("shortcuts", {}); self.d.update(d); self.d["shortcuts"].update(sc)

@@ -34,7 +34,7 @@ class MainWindow(Bone2DMixin, AutosaveMixin, MediaPreviewMixin, RecordMixin, Pro
         self.settings=Settings(); CFG['frame_cache']=self.settings['frame_cache']; CFG['hw_decode']=self.settings['hw_decode']; CFG['bake']=self.settings['bake']; CFG['fx_adapt']=self.settings['fx_adapt']; CFG['export_preset']=self.settings['export_preset']; CFG['show_build_preview']=self.settings['show_build_preview']; CFG['render_threads']=int(self.settings['render_threads']); CFG['bake_max_gb']=self.settings['bake_max_gb']; CFG['encode_hw']=self.settings['encode_hw']; CFG['proxy_height']=self.settings['proxy_height']; CFG['proxy_quality']=self.settings['proxy_quality']; CFG['proxy_budget_gb']=self.settings['proxy_budget_gb']; self.proj=None; self.t=0.0; self.sel=None; self.snap_on=self.settings['snap']; self.playing=False; self._mprev=None; self._undo=[]; self._redo=[]; self._last_state=None; self._clip_copy=None
         self.thumbs=ThumbStore(); self.pool=MediaPool(use_proxy=self.settings['proxy_preview']); self.renderer=Renderer(self.pool); self.audio=AudioPlayer(); self.timer=QTimer(self); self.timer.setInterval(self.frame_ms()); self.timer.timeout.connect(self.tick); self._last_tick=time.monotonic(); self.audio_seek_timer=QTimer(self); self.audio_seek_timer.setSingleShot(True); self.audio_seek_timer.setInterval(60); self.audio_seek_timer.timeout.connect(self._restart_audio_after_seek); QTimer.singleShot(400, self._init_gl)
         EXPORTS.max_parallel=int(self.settings['export_parallel']); EXPORTS.job_finished.connect(self._on_export_finished)
-        self.stack=QStackedWidget(); self.setCentralWidget(self.stack); self.home=QWidget(); self.stack.addWidget(self.home); self._build_home(); self.editor=QWidget(); self.stack.addWidget(self.editor); self.apply_shortcuts(); self.show_home(); self.autosave_apply()
+        from .shared.ui import FadeStack; self.stack=FadeStack(); self.setCentralWidget(self.stack); self.home=QWidget(); self.stack.addWidget(self.home); self._build_home(); self.home_toast=Toast(self.home); self.toast=self.home_toast; self.editor=QWidget(); self.stack.addWidget(self.editor); self.apply_shortcuts(); self.show_home(); self.autosave_apply()
     @staticmethod
     def _screen_hz():
         """Return the primary monitor's refresh rate (Hz), clamped 30–360."""
@@ -145,6 +145,9 @@ def main():
             import ctypes; ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MiniCut.Editor")      # so the taskbar shows our icon, not python's
         except Exception: pass
     app=QApplication(sys.argv); app.setApplicationName('MiniCut'); app.setStyle('Fusion'); app.setStyleSheet(QSS)
+    try:
+        from .shared.ui import TipManager; TipManager.install(app)          # rounded tooltips with a TIP badge
+    except Exception as ex: print('tips init failed', ex)
     ico = app_icon(); app.setWindowIcon(ico)
     win=MainWindow(); win.setWindowIcon(ico); apply_ui(win); win.restore_layout(); install_progress(win); install_gpu_surface()
     try:                                                   # Patch 57: every error goes through one hub: crash.log, a pop-up, a circuit breaker

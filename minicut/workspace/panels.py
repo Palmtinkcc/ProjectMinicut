@@ -627,7 +627,7 @@ class Inspector(Panel):
         # ---- Text ----
         sa, f = page(); sec = Section("Text", "text"); self.txt = TextBox(96); self.txt.textChanged.connect(lambda: self.on_text("text", self.txt.toPlainText())); sec.body.addWidget(self.txt); f.addWidget(sec)
         sec = Section("Style", "adjust")
-        fams = sorted(set(QFontDatabase.families())); self.font_cb = Dropdown([(x, x) for x in fams]); self.font_cb.changed.connect(lambda i: self.on_text("font", self.font_cb.currentData()))
+        self.font_cb = FontPicker(store=app.settings); self.font_cb.changed.connect(lambda i: self.on_text("font", self.font_cb.currentData()))
         self.fsize = NumberField(40, 4, 1000, 0, " px", "", scrub=1.0); self.fsize.changed.connect(lambda v: self.on_text("fsize", int(v)))
         self.tcol = ColorButton(); self.tcol.changed.connect(lambda c: self.on_text("tcolor", c))
         self.bold = Toggle("Bold"); self.bold.toggled.connect(lambda v: self.on_text("bold", v))

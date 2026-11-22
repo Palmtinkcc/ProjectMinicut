@@ -882,6 +882,7 @@ class TimelinePanel(QFrame):
         bar.addStretch(); head.addWidget(self.tools); head.addStretch(1); self.tool_btns = self.tools.findChildren(Btn)
         # Enable toolbar mode: labels hidden unless hovered or active
         for b in self.tool_btns:
+            b.bubble = True                      # hover = a small bubble with the name, pointing at the button
             if b.label and b.ic: b.setToolbarMode(True)
         self.snap_btn = Btn("Snap", "snap", "soft", "Clips click to the playhead and to each other", app.toggle_snap, True, 30); self.snap_btn.setChecked(app.snap_on); head.addWidget(self.snap_btn)
         self.zoomw = QWidget(); zl = QHBoxLayout(self.zoomw); zl.setContentsMargins(0, 0, 0, 0); zl.setSpacing(2)
@@ -889,7 +890,7 @@ class TimelinePanel(QFrame):
         self.zoom = Slider(0, 1000, 500, 500, 0, False); self.zoom.setFixedWidth(110); self.zoom.changed.connect(lambda v: app.timeline.set_zoom(2 * (1000 ** (v / 1000))) if not getattr(self, "_lock", False) else None); zl.addWidget(self.zoom)
         zl.addWidget(tool("", "Zoom in", lambda: app.timeline.set_zoom(app.timeline.pps * 1.25), icon="zoom_in", isize=20)); zl.addWidget(Btn("Fit", "zoom_fit", "ghost", "Show the whole project", lambda: app.timeline.zoom_fit(), h=30)); head.addWidget(self.zoomw)
         lay.addLayout(head)
-        self.stack = QStackedWidget(); lay.addWidget(self.stack, 1); page = QWidget(); pl = QVBoxLayout(page); pl.setContentsMargins(0, 0, 0, 0)
+        self.stack = FadeStack(); lay.addWidget(self.stack, 1); page = QWidget(); pl = QVBoxLayout(page); pl.setContentsMargins(0, 0, 0, 0)
         app.timeline = Timeline(app); g = QGridLayout(); g.setSpacing(0)
         g.addWidget(app.timeline, 0, 0); g.addWidget(app.timeline.vbar, 0, 1); g.addWidget(app.timeline.hbar, 1, 0)
         pl.addLayout(g, 1); self.stack.addWidget(page)

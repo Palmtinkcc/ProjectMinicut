@@ -395,10 +395,10 @@ class _ProjectCard(QFrame):
         self.update()
 
     def enterEvent(self, e):
-        self.hover = True; self.update(); super().enterEvent(e)
+        self.hover = True; anim_to(self, "h", 1.0, 160, 0.0); super().enterEvent(e)
 
     def leaveEvent(self, e):
-        self.hover = False; self.update(); super().leaveEvent(e)
+        self.hover = False; anim_to(self, "h", 0.0, 240, 1.0); super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.open_req.emit(self.path)
@@ -406,7 +406,7 @@ class _ProjectCard(QFrame):
 
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setRenderHint(QPainter.SmoothPixmapTransform); c = pal()
-        p.setPen(QPen(QColor(c["accent"] if self.hover else c["line"]), 1)); p.setBrush(QColor(c["field_h"] if self.hover else c["card"]))
+        h = anim_val(self, "h", 1.0 if self.hover else 0.0); p.setPen(QPen(mixc(c["line"], c["accent"], h), 1)); p.setBrush(mixc(c["card"], c["field_h"], h))
         p.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 12, 12)
         tr = QRectF(8, 8, self.W - 16, self.TH); clip = QPainterPath(); clip.addRoundedRect(tr, 8, 8)
         if self.img is not None and self.img.width() > 0 and self.img.height() > 0:
@@ -601,8 +601,8 @@ class _NavItem(QWidget):
         super().__init__(); self.text = text; self.star = star; self.active = active; self._hover = False
         self.setFixedHeight(40); self.setCursor(Qt.PointingHandCursor)
 
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
+    def enterEvent(self, e): self._hover = True; anim_to(self, "h", 1.0, 150, 0.0); super().enterEvent(e)
+    def leaveEvent(self, e): self._hover = False; anim_to(self, "h", 0.0, 220, 1.0); super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.clicked.emit()
@@ -611,7 +611,7 @@ class _NavItem(QWidget):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); x = 4
         if self.star:
             f = QFont(); f.setPixelSize(15); p.setFont(f); p.setPen(QColor("#ffc60a")); p.drawText(QRectF(0, 0, 18, self.height() - 4), Qt.AlignCenter, "\u2605"); x = 20
-        f = QFont(); f.setPixelSize(20); p.setFont(f); p.setPen(QColor("#ffffff" if (self.active or self._hover) else "#e4e4ea"))
+        f = QFont(); f.setPixelSize(20); p.setFont(f); p.setPen(QColor("#ffffff") if self.active else mixc("#e4e4ea", "#ffffff", anim_val(self, "h", 1.0 if self._hover else 0.0)))
         p.drawText(QRectF(x, 0, self.width() - x, self.height() - 4), Qt.AlignVCenter | Qt.AlignLeft, self.text)
         if self.active:
             p.setPen(Qt.NoPen); p.setBrush(QColor("#ffffff")); p.drawRoundedRect(QRectF(4, self.height() - 7, 112, 5), 2.5, 2.5)
@@ -623,16 +623,16 @@ class _GradButton(QPushButton):
         super().__init__(); self.label = text; self.radius = radius; self.plus = plus; self._hover = False; self._down = False
         self.setFixedSize(w, h); self.setCursor(Qt.PointingHandCursor); self.setToolTip(tip); self.setFlat(True)
 
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
+    def enterEvent(self, e): self._hover = True; anim_to(self, "h", 1.0, 150, 0.0); super().enterEvent(e)
+    def leaveEvent(self, e): self._hover = False; anim_to(self, "h", 0.0, 240, 1.0); super().leaveEvent(e)
     def mousePressEvent(self, e): self._down = True; self.update(); super().mousePressEvent(e)
     def mouseReleaseEvent(self, e): self._down = False; self.update(); super().mouseReleaseEvent(e)
 
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         g = QLinearGradient(r.topLeft(), r.bottomRight())
-        a, b = (("#2a4bff", "#00b8ff") if not self._hover else ("#4466ff", "#2cc4ff"))
-        if self._down: a, b = "#1c38d0", "#0092d0"
+        h = anim_val(self, "h", 1.0 if self._hover else 0.0); a, b = mixc("#2a4bff", "#4466ff", h), mixc("#00b8ff", "#2cc4ff", h)
+        if self._down: a, b = QColor("#1c38d0"), QColor("#0092d0"); r = r.adjusted(1, 1, -1, -1)
         g.setColorAt(0.0, QColor(a)); g.setColorAt(1.0, QColor(b)); p.setPen(Qt.NoPen); p.setBrush(g); p.drawRoundedRect(r, self.radius, self.radius)
         p.setPen(QPen(QColor("#ffffff"), max(3.0, self.height() * 0.07), Qt.SolidLine, Qt.RoundCap))
         if self.plus:
@@ -650,15 +650,15 @@ class _QuickBtn(QWidget):
         super().__init__(); self.label = label; self.outline = outline; self._hover = False
         self.setFixedSize(w, h); self.setCursor(Qt.PointingHandCursor); self.setToolTip(tip)
 
-    def enterEvent(self, e): self._hover = True; self.update(); super().enterEvent(e)
-    def leaveEvent(self, e): self._hover = False; self.update(); super().leaveEvent(e)
+    def enterEvent(self, e): self._hover = True; anim_to(self, "h", 1.0, 150, 0.0); super().enterEvent(e)
+    def leaveEvent(self, e): self._hover = False; anim_to(self, "h", 0.0, 220, 1.0); super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()): self.clicked.emit()
 
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        p.setBrush(QColor("#7a7a7a" if self._hover else "#666666")); p.setPen(QPen(QColor("#ffffff"), 1.5) if self.outline else Qt.NoPen)
+        p.setBrush(mixc("#666666", "#7a7a7a", anim_val(self, "h", 1.0 if self._hover else 0.0))); p.setPen(QPen(QColor("#ffffff"), 1.5) if self.outline else Qt.NoPen)
         p.drawRoundedRect(r, 5, 5)
         f = QFont(); f.setPixelSize(15 if self.width() >= 64 else 13); p.setFont(f); p.setPen(QColor("#ffffff")); p.drawText(r, Qt.AlignCenter, self.label)
 
@@ -795,6 +795,7 @@ class ProjectMixin:
         self.exit_media_preview(clear_selection=True)
         self.stop_play()
         self.stack.setCurrentWidget(self.home)
+        if getattr(self, "home_toast", None) is not None: self.toast = self.home_toast      # the editor's toast is hidden with the editor
         self.refresh_recent()
 
     def refresh_recent(self):
